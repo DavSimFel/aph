@@ -36,7 +36,11 @@ env:
 
 jobs:
   gates:
-    name: node 24 / ${{ matrix.suite }}
+    # `aph /` rather than upstream's `node 24 /`: a required status check
+    # matches on job name, and ci.yml already publishes `node 24 / static`
+    # from the job that cannot get a runner here. Sharing the name would let
+    # branch protection wait on the one that never reports.
+    name: aph / ${{ matrix.suite }}
     runs-on: ubuntu-latest
     # Only `static` blocks a merge. `coverage` and `snapshot` each carry a test
     # that assumes upstream's enterprise runner and fails on a hosted one:
@@ -85,10 +89,17 @@ jobs:
       # snapshot scenarios run real commands through it — including the pwsh
       # executor, whose tool never reaches the request without one. GitHub's
       # hosted image carries no bubblewrap; upstream's enterprise runners do.
-      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
-      # which bubblewrap needs, so installing the package is not enough. The
-      # smoke test below fails the job here rather than inside a snapshot diff.
+      # Only the snapshot scenarios execute commands through the product
+      # sandbox; static and coverage never reach it, and an apt call on their
+      # critical path is pure risk — one hung mirror already held this step for
+      # 25 minutes. The timeout keeps a stalled mirror from consuming the job,
+      # and the smoke test fails here rather than inside a snapshot diff.
+      #
+      # Ubuntu 24.04 restricts the unprivileged user namespaces bubblewrap
+      # needs, so installing the package alone leaves the backend unusable.
       - name: Install the sandbox backend
+        if: matrix.suite == 'snapshot'
+        timeout-minutes: 6
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
