@@ -1,0 +1,44 @@
+# Rendered by `make enable` into ~/.config/systemd/user/. Do not edit the
+# rendered copy; edit this template and re-run, or the next render overwrites it.
+#
+# The code tree is bind-mounted READ-ONLY: a running deployment cannot modify
+# the source it is executing. aph improves itself by opening a PR to dev and
+# being promoted through `make install`, never by editing the live process.
+# State and workspace are the only writable paths.
+[Unit]
+Description=@DESCRIPTION@
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DSH_HOME=@STATE@
+Environment=PATH=@NODEBIN@:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=@WORKSPACE@
+RuntimeDirectory=@RUNTIME@
+RuntimeDirectoryMode=0700
+# --host 0.0.0.0 is rejected by the web startup; the tunnel is the only ingress.
+# --trusted-host is required because cloudflared forwards the public Host header.
+ExecStart=@NODE@ @CODE@/apps/cli/lib/bin.js web --host 127.0.0.1 --port @PORT@ --trusted-host @DOMAIN@
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=tmpfs
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+BindReadOnlyPaths=@NODEROOT@
+BindReadOnlyPaths=@CODE@
+BindPaths=@STATE@
+BindPaths=@WORKSPACE@
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target
