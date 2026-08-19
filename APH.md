@@ -69,6 +69,10 @@ Upstream requires an Agent Note in `.agents/notes/` for every non-trivial change
 
 aph decisions are recorded in aph-owned documentation instead — this file while it is small enough, and a dedicated aph docs tree once it is not. The obligation is unchanged: a non-trivial aph change still records what was decided and why. Only the location moves.
 
+## The change workflow
+
+Operator intent becomes a GitHub issue, an aph session implements it, agents review it, and the operator judges only the delivered functionality. [aph/WORKFLOW.md](aph/WORKFLOW.md) owns the roles, roadmap, stage labels, PR structure, and review sequence.
+
 ## Services
 
 Both deployments run as systemd user units rendered from one template, [aph/systemd/aph-web.service.in](aph/systemd/aph-web.service.in). `make enable` renders and enables them, `make start` / `stop` / `restart` / `status` / `logs` drive them. Rendering resolves node to a real path and bind-mounts its installation prefix, because systemd starts the unit with no shell and `ProtectHome=tmpfs` would otherwise hide it.
