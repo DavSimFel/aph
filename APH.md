@@ -22,7 +22,19 @@ The architecture cooperates with this. Cordis composes everything from patch lay
 
 Work branches off `dev` and returns by PR. `main` advances only by promotion from `dev`. Upstream syncs enter through `make sync-upstream`, which fast-forwards `upstream` and opens a sync branch that reaches `dev` as an ordinary PR.
 
-Upstream's GitHub workflows all trigger on `master`, a branch that no longer exists, so they are dormant rather than deleted. aph CI arrives as new workflow files targeting `dev` and `main`. The exception is [e2e.yml](.github/workflows/e2e.yml), which triggers on `main` and self-skips without `DEEPSEEK_API_KEY`.
+## What CI runs
+
+Upstream's workflows carry two kinds of trigger and the fork meets them differently.
+
+Every `push:` trigger names `master`, a branch that does not exist here, so those lanes are dormant: `ci.yml`, `docs-pages.yml`, `release.yml`, `release-vendor.yml`, `landlock-run.yml`, and `sandbox.yml` never run on a push to an aph branch. Ten workflows also carry a `pull_request:` trigger with no branch filter, and an unfiltered trigger fires whatever the base branch is, so those run on every aph pull request: the Node 22.19 and 26 compatibility jobs, the Python SDK and runtime jobs, the Wine-hosted Windows gates, the path-filtered native landlock builds, and npm packing.
+
+**Upstream's three Linux enterprise jobs cannot run here.** `ci.yml` pins its static, coverage, and snapshot jobs to the `dsh-ubuntu-24-04-16core` pool and its native Windows job to `dsh-windows-2025-16core`. Those labels belong to the upstream organization; this repository has no runner carrying them, so the jobs queue until they expire, reporting neither success nor failure. [aph-ci.yml](.github/workflows/aph-ci.yml) runs the same three gate suites — `check:ci:static`, `check:ci:coverage`, `check:ci:snapshot` — on GitHub-hosted runners instead. It is a new file rather than an edit to `ci.yml` because upstream owns that file and every edit to it returns as a conflict on each sync.
+
+Hosted runners are smaller than the pools upstream's fixtures were recorded on, and they carry different tooling. The snapshot scenarios execute real commands through the product sandbox, which fails closed rather than running anything unconfined, so the lane installs bubblewrap and permits the unprivileged user namespaces it needs — Ubuntu 24.04 restricts those through AppArmor, and installing the package alone leaves the backend unusable. Two tests still assume upstream's machine, so only `static` gates a merge while `coverage` and `snapshot` report without blocking; the reasons and the route back to three blocking gates are in the workflow's own comment.
+
+aph-ci.yml also triggers on pushes to `dev` and `main`, which is the only post-merge evidence either branch gets. Of upstream's workflows, none run on a push to `dev`, and on a push to `main` only [e2e.yml](.github/workflows/e2e.yml) runs, self-skipping without `DEEPSEEK_API_KEY`.
+
+`issue-policy.yml` and `issue-lifecycle.yml` are **disabled on this repository**. [config.json](.github/issue-management/config.json) pins `organization` to a fixed value, so on the fork the policy script asks GitHub about a pull request in a repository that does not exist and exits non-zero; they also enforce upstream's issue conventions rather than the ones in [aph/WORKFLOW.md](aph/WORKFLOW.md). Disabling is a repository setting rather than a file change, so it survives every sync and reverses from the Actions tab.
 
 ## Environments
 
