@@ -36,7 +36,11 @@ env:
 
 jobs:
   gates:
-    name: node 24 / ${{ matrix.suite }}
+    # `aph /` rather than upstream's `node 24 /`: a required status check
+    # matches on job name, and ci.yml already publishes `node 24 / static`
+    # from the job that cannot get a runner here. Sharing the name would let
+    # branch protection wait on the one that never reports.
+    name: aph / ${{ matrix.suite }}
     runs-on: ubuntu-latest
     # Only `static` blocks a merge. `coverage` and `snapshot` each carry a test
     # that assumes upstream's enterprise runner and fails on a hosted one:
