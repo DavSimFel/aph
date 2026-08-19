@@ -22,7 +22,15 @@ The architecture cooperates with this. Cordis composes everything from patch lay
 
 Work branches off `dev` and returns by PR. `main` advances only by promotion from `dev`. Upstream syncs enter through `make sync-upstream`, which fast-forwards `upstream` and opens a sync branch that reaches `dev` as an ordinary PR.
 
-Upstream's GitHub workflows all trigger on `master`, a branch that no longer exists, so they are dormant rather than deleted. aph CI arrives as new workflow files targeting `dev` and `main`. The exception is [e2e.yml](.github/workflows/e2e.yml), which triggers on `main` and self-skips without `DEEPSEEK_API_KEY`.
+## What CI runs
+
+Upstream's workflows carry two kinds of trigger and the fork meets them differently.
+
+Every `push:` trigger names `master`, a branch that does not exist here, so those lanes are dormant: `ci.yml`, `docs-pages.yml`, `release.yml`, `release-vendor.yml`, `landlock-run.yml`, and `sandbox.yml` never run on a push to an aph branch. Ten workflows also carry a `pull_request:` trigger with no branch filter, and an unfiltered trigger fires whatever the base branch is, so the full upstream matrix — Node 22.19 through 26, coverage, snapshots, the Python SDK and wheels, the native landlock builds, and npm packing — already runs on every aph pull request.
+
+Nothing runs on a push to `dev`. On a push to `main` only [e2e.yml](.github/workflows/e2e.yml) runs, and it self-skips without `DEEPSEEK_API_KEY`. A change is therefore verified by its pull-request run and not verified again after the merge.
+
+`issue-policy.yml` and `issue-lifecycle.yml` fail on every aph pull request. [config.json](.github/issue-management/config.json) pins `organization` to a fixed value, so on the fork the policy script asks GitHub about a pull request in a repository that does not exist and exits non-zero. Their failure reports nothing about the change under review.
 
 ## Environments
 
