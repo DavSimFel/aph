@@ -34,12 +34,26 @@ Both environments run on the local machine and are reached through a Cloudflare 
 | Domain | `autopoiesis.feldhofer.cc` | `staging-autopoiesis.feldhofer.cc` |
 | Checkout | `~/.local/share/aph` | this repository |
 | State root | `~/.aph` | `./.aph` (git-ignored) |
-| Port | 3080 | 3081 |
+| Port | 16720 | 16721 |
 | Command | `make serve` | `make dev` |
+
+The ports are the ones `~/.cloudflared/config.yml` already routes to, so the tunnel needs no change. Both are currently served by an older `dsaph` deployment out of `/run/user/1000/`. Taking them over is a manual cutover of a running system, so `make` refuses a busy port rather than competing for it and names the override; `make doctor` reports which ports are free.
 
 The state roots are separate so a dev session can never write production sessions, settings, or credentials. Both are set through `DSH_HOME`, which the harness already treats as configurable, so no source change is involved.
 
 **The bind host is always loopback.** The web startup rejects `--host 0.0.0.0` outright because it would expose remote code execution to the network ([startup.ts](packages/bundle/web-app/src/startup.ts)). The tunnel is the only ingress, and authentication belongs to Cloudflare Zero Trust in front of it — never to a hand-rolled check inside the harness.
+
+**Serving needs `--trusted-host`.** Requests arrive from cloudflared carrying the public Host header, which the browser-trust fence refuses unless the authority is declared, so every `/api` call would 403 without it. Declaring the authority is the fence's own config seam rather than a weakening of it: the fence defends DNS rebinding, and an attacker cannot make `feldhofer.cc` resolve to this machine's loopback without controlling that DNS. `make serve` and `make dev` pass it; an undeclared authority is still refused.
+
+## The configuration plane is loopback-only
+
+A set of methods stays pinned to loopback even on a trusted-host deployment — `settings.*`, `credentials.*`, `llm.discoverModels`, agent-preset management, and the native host dialogs ([client/connection](packages/client/connection/src/index.ts)). Reads are pinned with writes, because `settings.describe` returns every exposed namespace and `credentials.describe` reports whether a named variable is configured. Over the tunnel these answer 403; the model picker is unaffected, since `llm.providers` and `llm.models` are deliberately excluded from the pin.
+
+This is upstream's decision and aph keeps it. `trustedHosts` is a DNS-rebinding fence and upstream states it is explicitly not authentication, so the configuration plane waits for a real authentication layer. Cloudflare Access is one, but the harness cannot see it, and the only sound way to teach the fence would be verifying a signed `CF_Authorization` JWT — trusting a `Cf-Access-Authenticated-User-Email` header would be spoofable by anything that reaches the origin. That belongs upstream as an extension point, not in the fork as a policy.
+
+Replacing the connection row by id to drop the pin is specifically rejected. It reads as the additive path, but it would make aph the silent owner of a list upstream actively curates, so a later upstream addition would leave a method unpinned that nobody here evaluated.
+
+The cost is smaller than it looks: the configuration plane is file-backed. Settings are `$DSH_HOME/settings.yaml`, re-read on change ([settings-file](packages/settings/settings-file/src/index.ts)), and credentials resolve from the environment and `.env`. Configuring providers and keys means editing files the harness already watches, over SSH or through the agent itself. The 403 costs a pane, not a capability.
 
 ## Devops is make
 

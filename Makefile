@@ -13,12 +13,26 @@ APH_PREFIX   ?= $(HOME)/.local/share/aph
 APH_BINDIR   ?= $(HOME)/.local/bin
 APH_HOME     ?= $(HOME)/.aph
 APH_DEV_HOME ?= $(CURDIR)/.aph
-APH_PORT     ?= 3080
-APH_DEV_PORT ?= 3081
-APH_LAUNCHER := $(APH_BINDIR)/aph
+APH_DOMAIN     ?= autopoiesis.feldhofer.cc
+APH_DEV_DOMAIN ?= staging-autopoiesis.feldhofer.cc
+APH_PORT       ?= 16720
+APH_DEV_PORT   ?= 16721
+APH_LAUNCHER   := $(APH_BINDIR)/aph
 
-# The web surface rejects --host 0.0.0.0 by design; a tunnel is the only ingress.
+# The web surface rejects --host 0.0.0.0 by design; the tunnel is the only ingress.
 APH_HOST := 127.0.0.1
+
+# Requests arrive from cloudflared carrying the public Host header, which the
+# browser-trust fence refuses unless the authority is declared. This is the
+# fence's own config seam, not a weakening of it: privileged methods stay
+# pinned to loopback either way, and an undeclared authority is still refused.
+# `--trusted-host` is variadic, so it always goes last on the command line.
+APH_TRUST     = --trusted-host $(APH_DOMAIN)
+APH_DEV_TRUST = --trusted-host $(APH_DEV_DOMAIN)
+
+# A port held by another process is a manual cutover, never something make
+# takes: the dsaph deployment serves 16720/16721 today.
+check_port = @if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:$(1)([[:space:]]|$$)'; then echo 'aph: port $(1) is already served by another process; stop it or override $(2)' >&2; exit 1; fi
 
 .DEFAULT_GOAL := help
 .PHONY: help doctor install uninstall serve build dev dev-run sync-upstream check check-all clean
@@ -40,6 +54,8 @@ doctor: ## Report toolchain, branch, and install state
 	@echo 'prefix  : $(APH_PREFIX) [$(shell test -e $(APH_PREFIX) && echo present || echo absent)]'
 	@echo 'launcher: $(APH_LAUNCHER) [$(shell test -x $(APH_LAUNCHER) && echo present || echo absent)]'
 	@echo 'aph home: $(APH_HOME) [$(shell test -d $(APH_HOME) && echo present || echo absent)]'
+	@echo 'main    : $(APH_DOMAIN) -> $(APH_HOST):$(APH_PORT) [$(shell ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:$(APH_PORT)([[:space:]]|$$)' && echo 'port busy' || echo 'port free')]'
+	@echo 'staging : $(APH_DEV_DOMAIN) -> $(APH_HOST):$(APH_DEV_PORT) [$(shell ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:$(APH_DEV_PORT)([[:space:]]|$$)' && echo 'port busy' || echo 'port free')]'
 	@case ":$$PATH:" in *":$(APH_BINDIR):"*) ;; \
 		*) echo; echo 'warning: $(APH_BINDIR) is not on PATH' ;; esac
 
@@ -71,19 +87,21 @@ uninstall: ## Remove the launcher and production checkout, keeping state
 	@if [ -e '$(APH_PREFIX)/.git' ]; then git -C $(APH_REPO) worktree remove --force '$(APH_PREFIX)'; fi
 	@echo 'removed launcher and checkout; $(APH_HOME) left intact'
 
-serve: ## Serve the installed production build (port 3080 by default)
+serve: ## Serve the installed production build (main)
 	@test -x '$(APH_LAUNCHER)' || { echo 'not installed; run: make install' >&2; exit 1; }
-	@'$(APH_LAUNCHER)' web --host $(APH_HOST) --port $(APH_PORT)
+	$(call check_port,$(APH_PORT),APH_PORT)
+	@'$(APH_LAUNCHER)' web --host $(APH_HOST) --port $(APH_PORT) $(APH_TRUST)
 
 build: ## Build the working tree
 	@pnpm run build
 
-dev: build dev-run ## Build and serve the working tree (port 3081 by default)
+dev: build dev-run ## Build and serve the working tree (staging)
 
 dev-run: ## Serve the working tree without rebuilding
 	@mkdir -p '$(APH_DEV_HOME)'
+	$(call check_port,$(APH_DEV_PORT),APH_DEV_PORT)
 	@DSH_HOME='$(APH_DEV_HOME)' node --import tsx/esm apps/cli/src/bin.ts \
-		web --host $(APH_HOST) --port $(APH_DEV_PORT)
+		web --host $(APH_HOST) --port $(APH_DEV_PORT) $(APH_DEV_TRUST)
 
 sync-upstream: ## Fast-forward the upstream branch and open a sync branch off dev
 	@git -C $(APH_REPO) diff --quiet || { echo 'working tree is dirty; commit or stash first' >&2; exit 1; }
