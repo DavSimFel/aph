@@ -1,0 +1,83 @@
+# aph's own CI lane.
+#
+# Upstream's ci.yml pins its three Linux enterprise jobs — static, coverage,
+# and snapshots — to the `dsh-ubuntu-24-04-16core` runner pool, which belongs to
+# the upstream organization. The fork has no runner carrying that label, so
+# those jobs queue until they expire and the gates they own never execute here.
+# This lane runs the same three gate suites on GitHub-hosted runners.
+#
+# It is a new file rather than an edit to ci.yml, per the additive rule in
+# APH.md: upstream owns ci.yml and every edit to it becomes a conflict on each
+# sync. When upstream's jobs cannot run here at all, adding a lane costs
+# nothing on a sync; retargeting theirs would cost a conflict forever.
+name: aph CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+# Cancel a superseded pull-request run — it is testing a commit that no longer
+# exists. Never cancel a push run: it is the only post-merge evidence that dev
+# and main hold what their pull requests claimed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+permissions:
+  contents: read
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  # Never report to the production telemetry endpoint baked into apps/cli/cordis.yml.
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  gates:
+    name: node 24 / ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [static, coverage, snapshot]
+    steps:
+      # Full history: the archive gate reads the pull request's base commit.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Configure pnpm store path
+        id: pnpm-store
+        run: |
+          store_root="$HOME/.local/share/pnpm/store"
+          echo "PNPM_CONFIG_STORE_DIR=$store_root" >> "$GITHUB_ENV"
+          store_path=$(PNPM_CONFIG_STORE_DIR="$store_root" pnpm store path --silent)
+          echo "path=$store_path" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-
+
+      - name: Install (immutable)
+        run: pnpm install --frozen-lockfile
+
+      # `verify-archived-agent-notes` defaults an unset base to HEAD; an empty
+      # string would reach git as a ref and fail, so a push supplies HEAD itself.
+      - name: Run the ${{ matrix.suite }} gates
+        env:
+          DSH_ARCHIVE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD' }}
+        run: pnpm run check:ci:${{ matrix.suite }}
