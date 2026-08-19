@@ -72,6 +72,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-
 
+      # The product sandbox fails closed when no backend is usable, and the
+      # snapshot scenarios run real commands through it — including the pwsh
+      # executor, whose tool never reaches the request without one. GitHub's
+      # hosted image carries no bubblewrap; upstream's enterprise runners do.
+      - name: Install the sandbox backend
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+
       - name: Install (immutable)
         run: pnpm install --frozen-lockfile
 
