@@ -1,0 +1,5 @@
+# The dev-branch aph state root: sessions, settings, profiles, and storages.
+# Local by definition and never committed. This file exists so the directory
+# ignores itself without editing the upstream .gitignore.
+*
+!.gitignore
