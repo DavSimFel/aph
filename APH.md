@@ -39,6 +39,8 @@ Both environments run on the local machine and are reached through a Cloudflare 
 
 The ports are the ones `~/.cloudflared/config.yml` already routes to, so the tunnel needs no change. Both are currently served by an older `dsaph` deployment out of `/run/user/1000/`. Taking them over is a manual cutover of a running system, so `make` refuses a busy port rather than competing for it and names the override; `make doctor` reports which ports are free.
 
+State roots are separate per deployment: production `~/.aph`, the staging service `~/.aph-staging`, and the interactive `make dev` server `./.aph` in this checkout. Nothing a dev run writes can reach production sessions, settings, or credentials.
+
 The state roots are separate so a dev session can never write production sessions, settings, or credentials. Both are set through `DSH_HOME`, which the harness already treats as configurable, so no source change is involved.
 
 **The bind host is always loopback.** The web startup rejects `--host 0.0.0.0` outright because it would expose remote code execution to the network ([startup.ts](packages/bundle/web-app/src/startup.ts)). The tunnel is the only ingress, and authentication belongs to Cloudflare Zero Trust in front of it — never to a hand-rolled check inside the harness.
@@ -66,3 +68,15 @@ The cost is smaller than it looks: the configuration plane is file-backed. Setti
 Upstream requires an Agent Note in `.agents/notes/` for every non-trivial change. aph does not add notes there. That tree is translation-paired (`.agents/notes/**/*.md` in [verify-translation-pairing.ts](scripts/verify-translation-pairing.ts)), so each note also demands a Chinese counterpart and a consistency record produced by a skill only the user may invoke, and every file aph added there would be fork divergence inside an upstream-owned directory.
 
 aph decisions are recorded in aph-owned documentation instead — this file while it is small enough, and a dedicated aph docs tree once it is not. The obligation is unchanged: a non-trivial aph change still records what was decided and why. Only the location moves.
+
+## Services
+
+Both deployments run as systemd user units rendered from one template, [aph/systemd/aph-web.service.in](aph/systemd/aph-web.service.in). `make enable` renders and enables them, `make start` / `stop` / `restart` / `status` / `logs` drive them. Rendering resolves node to a real path and bind-mounts its installation prefix, because systemd starts the unit with no shell and `ProtectHome=tmpfs` would otherwise hide it.
+
+`make install` deploys `origin/main` to `~/.local/share/aph` and `make install-staging` deploys `origin/dev` to `~/.local/share/aph-staging`, each as a detached worktree reset to the ref as fetched. Installing does not start anything; the unit does.
+
+`make dev` serves the working tree on the staging port for interactive work, so it and the staging service cannot both hold it. The port guard reports the conflict rather than either one winning silently: stop the service to take the port, start it again to hand it back.
+
+**A running deployment cannot modify its own code.** The unit bind-mounts the code tree read-only and leaves only the state root and the workspace writable. Self-improvement therefore runs through the branch flow — the system proposes a change as a PR to `dev`, and it reaches production by promotion and `make install` — never by a live process editing the source it is currently executing. This is the property that keeps autopoiesis reviewable, so a change that needs a writable code tree needs a different design, not a relaxed unit.
+
+The units supersede the earlier `dsaph` deployment's `autopoiesis.service` and `autopoiesis-staging.service`, which are disabled. Their state under `~/.local/state/dsaph/` and `~/.local/share/dsaph/` is left in place. `autopoiesis-gateway.service` and `autopoiesis-prototype.service` are unrelated services on other ports and are untouched.
