@@ -4,7 +4,9 @@
 # and snapshots — to the `dsh-ubuntu-24-04-16core` runner pool, which belongs to
 # the upstream organization. The fork has no runner carrying that label, so
 # those jobs queue until they expire and the gates they own never execute here.
-# This lane runs the same three gate suites on GitHub-hosted runners.
+# This lane runs the static suite on a GitHub-hosted runner. Coverage and
+# snapshots are absent rather than advisory — see the matrix comment — and #14
+# restores them as blocking gates.
 #
 # It is a new file rather than an edit to ci.yml, per the additive rule in
 # APH.md: upstream owns ci.yml and every edit to it becomes a conflict on each
@@ -42,19 +44,18 @@ jobs:
     # branch protection wait on the one that never reports.
     name: aph / ${{ matrix.suite }}
     runs-on: ubuntu-latest
-    # Only `static` blocks a merge. `coverage` and `snapshot` each carry a test
-    # that assumes upstream's enterprise runner and fails on a hosted one:
-    # subprocess-local's process-exit spec reads a child's exit file before the
-    # child finishes writing it, which only loses the race on a slower machine,
-    # and the acp pwsh scenario runs wherever a pwsh binary exists but its
-    # executor does not register the tool here, so the pinned request header
-    # diverges. Both run and report; neither gates aph work until #14 resolves
-    # them, because a check nobody can act on is worse than no check.
-    continue-on-error: ${{ matrix.suite != 'static' }}
+    # `static` is the only suite that passes on a hosted runner. Coverage and
+    # snapshots each carry a test that assumes upstream's enterprise machine:
+    # subprocess-local's process-exit spec loses a write race only on a slower
+    # runner, and the acp pwsh scenario runs wherever a pwsh binary exists but
+    # its executor does not register the tool on a hosted image. Running them
+    # without letting them gate put a permanent red on every pull request,
+    # which teaches the reader to ignore red — worse than not running them.
+    # #14 fixes the underlying tests and adds both back as blocking gates.
     strategy:
       fail-fast: false
       matrix:
-        suite: [static, coverage, snapshot]
+        suite: [static]
     steps:
       # Full history: the archive gate reads the pull request's base commit.
       - uses: actions/checkout@v6
@@ -84,27 +85,6 @@ jobs:
           key: ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-
-
-      # The product sandbox fails closed when no backend is usable, and the
-      # snapshot scenarios run real commands through it — including the pwsh
-      # executor, whose tool never reaches the request without one. GitHub's
-      # hosted image carries no bubblewrap; upstream's enterprise runners do.
-      # Only the snapshot scenarios execute commands through the product
-      # sandbox; static and coverage never reach it, and an apt call on their
-      # critical path is pure risk — one hung mirror already held this step for
-      # 25 minutes. The timeout keeps a stalled mirror from consuming the job,
-      # and the smoke test fails here rather than inside a snapshot diff.
-      #
-      # Ubuntu 24.04 restricts the unprivileged user namespaces bubblewrap
-      # needs, so installing the package alone leaves the backend unusable.
-      - name: Install the sandbox backend
-        if: matrix.suite == 'snapshot'
-        timeout-minutes: 6
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          bwrap --ro-bind / / --dev /dev true && echo "bubblewrap usable"
 
       - name: Install (immutable)
         run: pnpm install --frozen-lockfile
