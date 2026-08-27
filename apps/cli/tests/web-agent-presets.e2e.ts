@@ -7,13 +7,15 @@ import { Context } from '@deepseek-ai/cordis'
 import { boot, healProfilesModuleFallback, loadOverlayPatches, loadProfile } from '@deepseek-ai/dsh-app-boot'
 import { provideCmdline } from '@deepseek-ai/dsh-cmdline'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { resolveSessionPreset, SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-agent-presets'
 import { applyChildComposition, childSessionMeta } from '@deepseek-ai/dsh-subagent'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { CallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { renderSkillContent } from '@deepseek-ai/dsh-skill'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-compaction-basic'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-tools'
@@ -216,10 +218,10 @@ describe('the shipped Web composition', () => {
     }
   })
 
-  it('supplies both shipped presets, and only those, from the system root', async () => {
+  it('supplies every shipped preset, and only those, from the system root', async () => {
     const listed = await ctx.agentPresets.list()
 
-    expect(listed.map(preset => preset.id).sort()).toEqual(['code', 'cordis', 'minimal', 'standard'])
+    expect(listed.map(preset => preset.id).sort()).toEqual(['aph-implementer', 'code', 'cordis', 'minimal', 'standard'])
     expect(listed.every(preset => preset.trust === 'system')).toBe(true)
     expect(ctx.agentPresets.defaultId).toBe('standard')
   })
@@ -243,6 +245,69 @@ describe('the shipped Web composition', () => {
       ])
     } finally {
       await handle.dispose()
+    }
+  })
+
+  it('assembles the implementer persona, skill catalog, and one-paste workflow keylessly', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'aph-implementer-preset-'))
+    const settingsFile = join(workspace, 'settings.yaml')
+    await writeFile(settingsFile, '{}\n')
+    const implementerCtx = await bootWeb(settingsFile)
+    const handle = await implementerCtx.agents.create({
+      sessionId: SessionId(`preset-implementer-${randomUUID()}`),
+      meta: { cwd: workspace },
+      agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+      setup: agentCtx => implementerCtx.agentPresets.mount(agentCtx, 'aph-implementer').then(() => undefined),
+    })
+    try {
+      const assembly = await implementerCtx.systemPrompt.assemble({ scope: handle.agent })
+      const personaSection = assembly.sections.find(section => section.name === 'deployment:persona')
+      if (personaSection === undefined) throw new Error('implementer preset omitted its persona')
+      const persona = renderPrompt({
+        ...assembly,
+        sections: [personaSection],
+        variables: {
+          ...assembly.variables,
+          cwd: handle.agent.session.header.cwd,
+          model: handle.agent.options.model,
+        },
+      }).replaceAll(workspace, '{{cwd}}')
+
+      const issueMessage = createUserMessage({
+        content: [{ type: 'text', text: 'https://github.com/DavSimFel/aph/issues/123' }],
+        source: { kind: 'user' },
+      })
+      const signal = new AbortController().signal
+      const decision = await agentEvents(implementerCtx, handle.agent).waterfall(
+        'agent/pre-step',
+        { messages: [issueMessage], turn: 1, step: 1, signal },
+        () => Promise.resolve({ kind: 'enter' as const, messages: [issueMessage] }),
+      )
+      if (decision.kind === 'reject') throw new Error('implementer preset rejected the issue prompt')
+      const catalog = decision.messages.find(message => message.source.kind === 'skill-catalog')
+      if (catalog === undefined) throw new Error('implementer preset omitted its skill catalog')
+      const catalogEntry = catalog.content
+        .flatMap(block => block.type === 'text' ? block.text.split('\n') : [])
+        .find(line => line.startsWith('- `aph-issue-implementer`:'))
+      if (catalogEntry === undefined) throw new Error('implementer skill was absent from the model catalog')
+
+      const skill = await implementerCtx.skills.get('aph-issue-implementer', {
+        cwd: workspace,
+        scope: handle.agent,
+        signal,
+      })
+      if (skill === undefined) throw new Error('implementer skill could not be loaded')
+      const skillDir = skill.resourceBase?.kind === 'directory' ? skill.resourceBase.path : undefined
+      let workflow = renderSkillContent(skill).replaceAll(workspace, '{{cwd}}')
+      if (skillDir !== undefined) workflow = workflow.replaceAll(skillDir, '{{skillDir}}')
+
+      expect({ persona, catalogEntry, workflow }).toMatchSnapshot()
+    } finally {
+      try {
+        await handle.dispose()
+      } finally {
+        await implementerCtx.fiber.dispose()
+      }
     }
   })
 

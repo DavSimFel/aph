@@ -1,0 +1,3 @@
+name: aph Implementer
+description: Implements one approved DavSimFel/aph issue from its URL through a checked draft pull request and agent-review handoff.
+order: 5

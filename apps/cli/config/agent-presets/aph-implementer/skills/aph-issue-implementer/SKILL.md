@@ -1,0 +1,58 @@
+---
+name: aph-issue-implementer
+description: Implement one approved DavSimFel/aph roadmap issue from its GitHub URL through an isolated worktree, focused checks, a conforming draft pull request, and stage/agent-review handoff. Load this before taking task actions whenever the user asks to implement or links an aph issue.
+---
+
+# Implement one aph issue
+
+The issue URL is the complete briefing. Act as the implementer and carry the issue to a draft pull request; do not stop after planning, and do not review or approve the result.
+
+## Admission
+
+Accept exactly one URL matching `https://github.com/DavSimFel/aph/issues/<number>`. Do not reinterpret another repository, pull request, issue number, or prose summary as the task.
+
+Before any implementation edit or GitHub mutation:
+
+1. Read the issue body and every comment with `gh issue view <number> --repo DavSimFel/aph --comments --json number,title,body,state,labels,comments,url`.
+2. Treat **Intent** as the operator acceptance test. **Context**, **Non-goals**, and **Verification** are binding implementation constraints.
+3. Verify the issue is open and carries `stage/ready`. A resumed session may instead continue an issue at `stage/in-session` only when an existing assignment comment contains this exact session's `DSH_SESSION_ID` and the recoverable branch and worktree still match it. Reject every other state before editing.
+4. Verify `gh repo view --json nameWithOwner` and the `origin` remote both identify `DavSimFel/aph`.
+5. Resolve every issue or pull request explicitly described as a dependency or prerequisite. A pull request must be merged and an issue must be closed. Context links that are not described as dependencies remain context. Stop with the unresolved URL and required state instead of working around it.
+6. Verify `DSH_SESSION_ID` is non-empty, `gh auth status` succeeds, the development checkout is writable, and the Git identity has non-empty `user.name` and `user.email`. A read-only serving tree is not a development checkout; report that a writable clone or worktree host is required.
+7. Read the checkout's `AGENTS.md` and `APH.md`. Read applicable subtree `AGENTS.md` files and every skill their scope requires before changing files.
+
+Do not claim an issue that fails admission. Name the failed condition and the concrete correction.
+
+## Isolate and claim
+
+Never implement in the shared checkout, reuse another session's worktree, clean unrelated changes, or base work on a local `dev` branch.
+
+1. Run `git fetch origin dev`, then verify the fetched `origin/dev` commit.
+2. Inspect `git worktree list --porcelain` before choosing names. Use branch `issue-<number>-implementer` and sibling worktree `../aph-issue-<number>` unless an existing same-session worktree already owns that branch. Both names must retain the issue number so a resumed session can find them.
+3. Create the branch and worktree directly from current `origin/dev`. If either name belongs to a different worktree or session, stop; never delete, reset, or reuse it.
+4. Confirm the new worktree is clean and its `HEAD` equals `origin/dev`.
+5. Comment `Assigned to DSH session \`<DSH_SESSION_ID>\` for implementation.` on the issue.
+6. Move the issue from `stage/ready` to `stage/in-session`, then re-read its labels. If either GitHub mutation fails, stop before editing. Retry the failed mutation only; do not leave two sessions silently eligible to claim the same issue.
+
+All later file reads, edits, checks, commits, and pushes run from the isolated worktree.
+
+## Implement
+
+Inspect existing behavior before modifying a file. Prefer aph-owned new files under the additive rule; when an upstream-owned file must change, record why no additive path can provide the behavior.
+
+Implement the complete issue, including documentation and the tests required by `AGENTS.md`. Preserve **Non-goals**. Exercise **Verification** where the environment permits. Resolve discoverable details from the repository instead of asking the operator to restate the issue.
+
+Use a task list for multi-step work. Use a same-session goal only for work that genuinely needs autonomous continuation. Delegation may assist implementation, but the parent session remains responsible for the final diff and handoff.
+
+## Check and publish
+
+1. Inspect the final diff and load `dsh-pre-push-checks` before selecting checks. Run the smallest checks covering the outgoing diff. Never weaken, skip, quarantine, or relabel a required failure. Record only commands actually run.
+2. Run `git diff --check` and confirm the final diff contains no accidental `vendor/` changes.
+3. Commit with the repository's configured `user.name` and `user.email`. Do not invent a model identity or add an automated co-author trailer. The issue assignment comment containing `DSH_SESSION_ID` is the session attribution record.
+4. Push the issue branch without bypassing hooks or branch protection.
+5. Copy `aph/templates/pr.md` to a temporary body file, fill every field, and open a draft pull request against `dev` with `gh pr create --draft --base dev --body-file <file>`. Nothing precedes **For the operator**.
+6. In **For the operator**, include the issue link and one-sentence Intent, behavior delivered, an exact demonstration command or URL with no setup left to the reader, every decision beyond the issue or `none`, and risk with rollback. Keep implementation details and exact check commands in the collapsed technical section.
+7. Apply one `kind/*` label and every material `area/*` label required by repository instructions.
+8. Comment the pull request URL on the issue. Move the issue from `stage/in-session` to `stage/agent-review` and verify the label.
+
+Stop after reporting the draft pull request URL. Do not mark it ready, review it, approve it, merge it, move the issue to operator review, promote `dev`, or install production.

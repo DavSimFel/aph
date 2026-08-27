@@ -20,7 +20,7 @@ The operator never reads code, diffs, or the agent review trail. A change that f
 
 The roadmap is the GitHub issue list on this repository, with milestones as phases. There is no project board.
 
-An issue is a brief sized for one aph session, and pasting its URL into a session is the complete briefing — the session receives nothing else. The body follows [templates/issue.md](templates/issue.md): **Intent** is the operator's acceptance test in the operator's own words, recorded before implementation starts, and the only thing the operator later reviews the PR against; **Context** points into the repository and prior issues; **Non-goals** bound the work; **Verification** names how a reviewer demonstrates the result.
+An issue is a brief sized for one aph session, and pasting its URL into a fresh session on the shipped `aph Implementer` preset is the complete briefing — the session receives nothing else. The preset's bundled `aph-issue-implementer` skill validates admission, isolates the work, and carries the issue through the draft-PR handoff. The body follows [templates/issue.md](templates/issue.md): **Intent** is the operator's acceptance test in the operator's own words, recorded before implementation starts, and the only thing the operator later reviews the PR against; **Context** points into the repository and prior issues; **Non-goals** bound the work; **Verification** names how a reviewer demonstrates the result.
 
 The manager writes each issue from raw operator intent and labels it `stage/spec`. Operator approval moves it to `stage/ready`. The operator assigns work by pasting the issue into an aph session; the assignment is recorded as an issue comment naming the session, and the label moves to `stage/in-session`.
 
@@ -31,6 +31,8 @@ Stage labels live on the issue only, and the manager maintains them: `stage/spec
 A PR body starts with a **For the operator** section and puts nothing above it, per [templates/pr.md](templates/pr.md): the issue link with a one-sentence intent, what changed in behavior terms, the exact command or URL that shows it working, every decision the implementer made beyond the issue, and risk with rollback. Implementation notes, checks run, and the review trail sit below it in a collapsed section.
 
 Agents open PRs with `gh pr create --body-file` over the template, so upstream's `.github/pull_request_template.md` stays unedited per [the additive rule](../APH.md#the-additive-rule).
+
+Implementer commits use the repository's configured `user.name` and `user.email`; the issue assignment comment containing `DSH_SESSION_ID` attributes the implementation session. Implementers do not invent a model identity or add an automated co-author trailer.
 
 The **For the operator** section is the implementer describing its own work, so review audits it like code: a claim the diff does not support, or an omitted decision, is a finding.
 
