@@ -1,7 +1,8 @@
 #!/usr/bin/env -S pnpm exec tsx
 
 import { execFile } from 'node:child_process'
-import { appendFile, lstat, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { appendFile, link, lstat, mkdir, open, readFile, rm, stat, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
@@ -76,6 +77,7 @@ interface AdmissionResult {
   readonly issue: ApprovedIssue
   readonly stage: Stage
   readonly claim: ClaimRecord | undefined
+  readonly dependencies: readonly string[]
   readonly trustedAmendments: readonly string[]
   readonly ignoredCommentCount: number
 }
@@ -86,7 +88,7 @@ export interface IssueSessionAdapter {
   readIssue(number: number): Promise<IssueRecord>
   readClaim(number: number): Promise<ClaimRecord | undefined>
   readDependency(url: string): Promise<DependencyRecord>
-  ensureWorktree(number: number, sessionId: string): Promise<WorktreeRecord>
+  ensureWorktree(number: number, sessionId: string, claim: ClaimRecord | undefined): Promise<WorktreeRecord>
   removeWorktree(worktree: WorktreeRecord): Promise<void>
   tryCreateClaim(claim: ClaimRecord): Promise<boolean>
   addIssueComment(number: number, body: string): Promise<void>
@@ -99,7 +101,6 @@ export interface IssueSessionAdapter {
 export interface AdmissionInput {
   readonly issueUrl: string
   readonly sessionId: string
-  readonly dependencies?: readonly string[]
 }
 
 /** Claim result returned to the agent before implementation begins. */
@@ -126,7 +127,7 @@ export class IssueSessionCoordinator {
 
   /**
    * Validate one issue without mutating Git, GitHub, or the worktree.
-   * @param input - issue URL, current session identity, and explicit dependencies extracted from the trusted briefing.
+   * @param input - issue URL and current session identity.
    * @returns the approved briefing and resumable state.
    */
   async inspect(input: AdmissionInput): Promise<AdmissionResult> {
@@ -152,12 +153,14 @@ export class IssueSessionCoordinator {
     if (stage !== 'stage/ready' && !(resumable && (stage === 'stage/in-session' || stage === 'stage/agent-review'))) {
       throw new Error(`issue-session: issue #${number} is ${stage}, expected stage/ready`)
     }
-    await this.verifyDependencies(input.dependencies ?? [])
+    const dependencies = issueDependencies(issue.body, issue.number)
+    await this.verifyDependencies(dependencies)
     const trusted = trustedComments(issue.comments)
     return {
       issue: approvedIssue(issue),
       stage,
       claim,
+      dependencies,
       trustedAmendments: trusted.amendments,
       ignoredCommentCount: trusted.ignored,
     }
@@ -170,7 +173,7 @@ export class IssueSessionCoordinator {
    */
   async claim(input: AdmissionInput): Promise<ClaimResult> {
     const admitted = await this.inspect(input)
-    const worktree = await this.adapter.ensureWorktree(admitted.issue.number, input.sessionId)
+    const worktree = await this.adapter.ensureWorktree(admitted.issue.number, input.sessionId, admitted.claim)
     const proposed: ClaimRecord = {
       issue: admitted.issue.number,
       sessionId: input.sessionId,
@@ -184,7 +187,7 @@ export class IssueSessionCoordinator {
       claim = created ? proposed : await this.adapter.readClaim(admitted.issue.number)
     }
     if (claim?.sessionId !== input.sessionId) {
-      if (worktree.created) await this.adapter.removeWorktree(worktree)
+      await this.adapter.removeWorktree(worktree)
       const owner = claim?.sessionId ?? 'an unreadable remote reservation'
       throw new Error(`issue-session: issue #${admitted.issue.number} is reserved by ${owner}`)
     }
@@ -319,54 +322,78 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     return { url: record.url, kind: 'issue', closed: record.state === 'CLOSED', merged: false }
   }
 
-  async ensureWorktree(number: number, sessionId: string): Promise<WorktreeRecord> {
+  async ensureWorktree(number: number, sessionId: string, claim: ClaimRecord | undefined): Promise<WorktreeRecord> {
     const { stdout: rootOutput } = await run('git', ['rev-parse', '--show-toplevel'], this.cwd)
     const root = rootOutput.trim()
     const worktreeRoot = join(root, '.aph-worktrees')
     const path = join(worktreeRoot, `issue-${number}`)
     const branch = `issue-${number}-implementer`
     const ownerFile = join(worktreeRoot, `issue-${number}.owner.json`)
+    const dependenciesFile = join(worktreeRoot, `issue-${number}.dependencies.json`)
     await ensureLocalExclude(root)
     await run('git', ['fetch', 'origin', 'dev'], root)
     const { stdout: baseOutput } = await run('git', ['rev-parse', 'origin/dev'], root)
-    const base = baseOutput.trim()
-    const existingOwner = await readOwner(ownerFile)
-    if (existingOwner !== undefined && existingOwner.sessionId !== sessionId) {
-      throw new Error(`issue-session: local issue #${number} worktree belongs to DSH session ${existingOwner.sessionId}`)
-    }
-    const { stdout: worktrees } = await run('git', ['worktree', 'list', '--porcelain'], root)
-    const existing = parseWorktrees(worktrees).find(entry => entry.path === path || entry.branch === `refs/heads/${branch}`)
-    if (existing !== undefined) {
-      if (existing.path !== path || existing.branch !== `refs/heads/${branch}` || existingOwner?.sessionId !== sessionId) {
-        throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
-      }
-      await ensureWorktreeDependencies(root, path)
-      await verifyWorktree(path, base)
-      return { path, branch, base, created: false }
-    }
-    if (existingOwner !== undefined) {
-      throw new Error(`issue-session: owner record for issue #${number} exists without its worktree`)
-    }
+    const currentBase = baseOutput.trim()
+    if (claim !== undefined) requireMatchingClaim(claim, { issue: number, sessionId, branch, worktree: path })
+
     await mkdir(worktreeRoot, { recursive: true })
-    await run('git', ['worktree', 'add', '-b', branch, path, 'origin/dev'], root)
-    try {
-      await ensureWorktreeDependencies(root, path)
-      await writeFile(ownerFile, `${JSON.stringify({ issue: number, sessionId, branch, path, base })}\n`, { flag: 'wx' })
-      await verifyWorktree(path, base)
-    } catch (error) {
-      await run('git', ['worktree', 'remove', path], root).catch(() => undefined)
-      await run('git', ['branch', '-D', branch], root).catch(() => undefined)
-      throw error
+    let owner = await readOwner(ownerFile, number)
+    if (owner !== undefined && owner.sessionId !== sessionId) {
+      throw new Error(`issue-session: local issue #${number} worktree belongs to DSH session ${owner.sessionId}`)
     }
-    return { path, branch, base, created: true }
+    let existing = await findIssueWorktree(root, path, branch)
+    if (existing !== undefined && (existing.path !== path || existing.branch !== `refs/heads/${branch}`)) {
+      throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
+    }
+    if (owner === undefined && existing !== undefined && claim === undefined) {
+      throw new Error(`issue-session: local branch or worktree for issue #${number} has no durable owner`)
+    }
+
+    const intended: ClaimRecord = claim ?? { issue: number, sessionId, branch, worktree: path, base: currentBase }
+    if (owner === undefined) {
+      await publishOwner(ownerFile, intended)
+      owner = intended
+    } else if (claim === undefined) {
+      requireMatchingClaim(owner, { issue: number, sessionId, branch, worktree: path })
+    } else {
+      requireMatchingClaim(owner, intended)
+    }
+
+    if (claim === undefined && owner.base !== currentBase) {
+      await removeProvisionalWorktree(root, existing, owner, dependenciesFile)
+      await rm(ownerFile, { force: true })
+      owner = { ...intended, base: currentBase }
+      await publishOwner(ownerFile, owner)
+      existing = undefined
+    }
+
+    let created = false
+    if (existing === undefined) {
+      await addOwnedWorktree(root, owner, claim !== undefined)
+      existing = await findIssueWorktree(root, path, branch)
+      if (existing === undefined) throw new Error(`issue-session: created worktree ${path} was not registered`)
+      created = true
+    }
+    if (existing.path !== path || existing.branch !== `refs/heads/${branch}`) {
+      throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
+    }
+    await ensureWorktreeDependencies(path, dependenciesFile, owner.base)
+    if (claim === undefined) await verifyFreshWorktree(path, owner.base)
+    else await verifyClaimedWorktree(path, owner.base)
+    return { path, branch, base: owner.base, created }
   }
 
   async removeWorktree(worktree: WorktreeRecord): Promise<void> {
     const root = dirname(dirname(worktree.path))
-    await run('git', ['worktree', 'remove', worktree.path], root)
+    await run('git', ['worktree', 'remove', '--force', worktree.path], root)
     await run('git', ['branch', '-D', worktree.branch], root)
     const match = worktree.path.match(/issue-(\d+)$/u)
-    if (match !== null) await rm(join(dirname(worktree.path), `issue-${match[1]}.owner.json`), { force: true })
+    if (match !== null) {
+      await Promise.all([
+        rm(join(dirname(worktree.path), `issue-${match[1]}.owner.json`), { force: true }),
+        rm(join(dirname(worktree.path), `issue-${match[1]}.dependencies.json`), { force: true }),
+      ])
+    }
   }
 
   async tryCreateClaim(claim: ClaimRecord): Promise<boolean> {
@@ -430,6 +457,33 @@ function trustedComments(comments: readonly IssueComment[]): { amendments: strin
 
 function trustedOwner(comment: IssueComment): boolean {
   return comment.author.login === OWNER && comment.authorAssociation === 'OWNER'
+}
+
+function issueDependencies(body: string, issueNumber: number): string[] {
+  const lines = body.split(/\r?\n/u)
+  const headings = lines.map((line, index) => line.trim() === '## Dependencies' ? index : -1).filter(index => index >= 0)
+  if (headings.length > 1) throw new Error('issue-session: issue body has multiple ## Dependencies sections')
+  const start = headings[0]
+  if (start === undefined) throw new Error('issue-session: issue body is missing the required ## Dependencies section')
+  const section = lines.slice(start + 1).findIndex(line => /^##\s+/u.test(line.trim()))
+  const entries = lines.slice(start + 1, section < 0 ? undefined : start + 1 + section)
+    .map(line => line.trim())
+    .filter(line => line !== '' && !/^<!--.*-->$/u.test(line))
+  if (entries.length === 0) throw new Error('issue-session: ## Dependencies must contain `- None` or repository issue and pull request URLs')
+  if (entries.length === 1 && entries[0] === '- None') return []
+  if (entries.includes('- None')) throw new Error('issue-session: ## Dependencies cannot combine `- None` with URLs')
+  const dependencies = entries.map((entry) => {
+    const match = entry.match(/^- (https:\/\/github\.com\/DavSimFel\/aph\/(?:issues|pull)\/[1-9]\d*)$/u)
+    if (match?.[1] === undefined) throw new Error(`issue-session: invalid dependency entry ${entry}`)
+    return match[1]
+  })
+  if (new Set(dependencies).size !== dependencies.length) {
+    throw new Error('issue-session: ## Dependencies contains a duplicate URL')
+  }
+  if (dependencies.includes(`https://github.com/${REPOSITORY}/issues/${issueNumber}`)) {
+    throw new Error(`issue-session: issue #${issueNumber} cannot depend on itself`)
+  }
+  return dependencies
 }
 
 function issueStage(issue: IssueRecord): string {
@@ -514,67 +568,198 @@ async function ensureLocalExclude(root: string): Promise<void> {
     if (isNodeError(error) && error.code === 'ENOENT') return ''
     throw error
   })
-  const lines = existing.split(/\r?\n/u)
-  const missing = ['/.aph-worktrees/', '/node_modules'].filter(entry => !lines.includes(entry))
-  if (missing.length === 0) return
+  if (existing.split(/\r?\n/u).includes('/.aph-worktrees/')) return
   const separator = existing.endsWith('\n') || existing === '' ? '' : '\n'
-  await appendFile(exclude, `${separator}${missing.join('\n')}\n`)
+  await appendFile(exclude, `${separator}/.aph-worktrees/\n`)
 }
 
-async function ensureWorktreeDependencies(root: string, worktree: string): Promise<void> {
-  const source = join(root, 'node_modules')
-  const target = join(worktree, 'node_modules')
-  const sourceStat = await stat(source).catch((error: unknown) => {
-    if (isNodeError(error) && error.code === 'ENOENT') return undefined
-    throw error
-  })
-  if (sourceStat === undefined || !sourceStat.isDirectory()) {
-    throw new Error(`issue-session: ${root} has no node_modules directory; run pnpm install before claiming`)
-  }
-  const targetStat = await lstat(target).catch((error: unknown) => {
-    if (isNodeError(error) && error.code === 'ENOENT') return undefined
-    throw error
-  })
-  if (targetStat === undefined) {
-    await symlink(source, target, process.platform === 'win32' ? 'junction' : 'dir')
-    return
-  }
-  if (targetStat.isDirectory()) return
-  if (targetStat.isSymbolicLink()) {
-    const [actual, expected] = await Promise.all([realpath(target), realpath(source)])
-    if (actual === expected) return
-  }
-  throw new Error(`issue-session: ${target} is not a usable dependency directory`)
+async function findIssueWorktree(
+  root: string,
+  path: string,
+  branch: string,
+): Promise<{ path: string; branch: string | undefined } | undefined> {
+  const { stdout } = await run('git', ['worktree', 'list', '--porcelain', '-z'], root)
+  return parseWorktrees(stdout).find(entry => entry.path === path || entry.branch === `refs/heads/${branch}`)
 }
 
-async function readOwner(path: string): Promise<{ sessionId: string } | undefined> {
+async function localBranchHead(root: string, branch: string): Promise<string | undefined> {
+  const { stdout } = await run('git', ['for-each-ref', '--format=%(objectname)', `refs/heads/${branch}`], root)
+  return stdout.trim() || undefined
+}
+
+async function publishCompleteFile(path: string, content: string): Promise<boolean> {
+  const temp = `${path}.${randomBytes(6).toString('hex')}.tmp`
+  const handle = await open(temp, 'wx', 0o600)
+  let closed = false
+  try {
+    await handle.writeFile(content)
+    await handle.sync()
+    await handle.close()
+    closed = true
+    // A hard-link commit is no-clobber and exposes only the complete synced inode.
+    await link(temp, path)
+    return true
+  } catch (error) {
+    if (!isNodeError(error) || (error.code !== 'EEXIST' && error.code !== 'EPERM')) throw error
+    const existing = await lstat(path).catch((statError: unknown) => {
+      if (isNodeError(statError) && statError.code === 'ENOENT') return undefined
+      throw statError
+    })
+    if (existing === undefined) throw error
+    return false
+  } finally {
+    if (!closed) await handle.close()
+    await unlink(temp).catch((error: unknown) => {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error
+    })
+  }
+}
+
+async function publishOwner(path: string, owner: ClaimRecord): Promise<void> {
+  if (await publishCompleteFile(path, `${JSON.stringify(owner)}\n`)) return
+  const existing = await readOwner(path, owner.issue)
+  if (existing === undefined) throw new Error(`issue-session: local owner record ${path} disappeared during publication`)
+  requireMatchingClaim(existing, owner)
+}
+
+async function readOwner(path: string, number: number): Promise<ClaimRecord | undefined> {
   const content = await readFile(path, 'utf8').catch((error: unknown) => {
     if (isNodeError(error) && error.code === 'ENOENT') return undefined
     throw error
   })
   if (content === undefined) return undefined
-  const owner = JSON.parse(content) as { sessionId?: unknown }
-  if (typeof owner.sessionId !== 'string') throw new Error(`issue-session: invalid local owner record ${path}`)
-  return { sessionId: owner.sessionId }
+  const owner = JSON.parse(content) as Partial<ClaimRecord>
+  if (owner.issue !== number || typeof owner.sessionId !== 'string' || typeof owner.branch !== 'string'
+    || typeof owner.worktree !== 'string' || typeof owner.base !== 'string') {
+    throw new Error(`issue-session: invalid local owner record ${path}`)
+  }
+  return owner as ClaimRecord
 }
 
-async function verifyWorktree(path: string, base: string): Promise<void> {
+function requireMatchingClaim(actual: ClaimRecord, expected: {
+  issue: number
+  sessionId: string
+  branch: string
+  worktree: string
+  base?: string
+}): void {
+  if (actual.issue !== expected.issue || actual.sessionId !== expected.sessionId || actual.branch !== expected.branch
+    || actual.worktree !== expected.worktree || (expected.base !== undefined && actual.base !== expected.base)) {
+    throw new Error(`issue-session: issue #${expected.issue} ownership does not match this worktree`)
+  }
+}
+
+async function addOwnedWorktree(root: string, owner: ClaimRecord, allowProgress: boolean): Promise<void> {
+  const head = await localBranchHead(root, owner.branch)
+  if (head === undefined) {
+    await run('git', ['worktree', 'add', '-b', owner.branch, owner.worktree, owner.base], root)
+    return
+  }
+  if (allowProgress) await verifyAncestor(root, owner.base, head)
+  else if (head !== owner.base) throw new Error(`issue-session: unclaimed branch ${owner.branch} moved from its recorded base`)
+  await run('git', ['worktree', 'add', owner.worktree, owner.branch], root)
+}
+
+async function removeProvisionalWorktree(
+  root: string,
+  existing: { path: string; branch: string | undefined } | undefined,
+  owner: ClaimRecord,
+  dependenciesFile: string,
+): Promise<void> {
+  if (existing !== undefined) {
+    await verifyFreshWorktree(owner.worktree, owner.base)
+    await run('git', ['worktree', 'remove', owner.worktree], root)
+  }
+  const head = await localBranchHead(root, owner.branch)
+  if (head !== undefined) {
+    if (head !== owner.base) throw new Error(`issue-session: unclaimed branch ${owner.branch} moved from its recorded base`)
+    await run('git', ['branch', '-D', owner.branch], root)
+  }
+  await rm(dependenciesFile, { force: true })
+}
+
+async function ensureWorktreeDependencies(worktree: string, markerPath: string, base: string): Promise<void> {
+  const marker = await readFile(markerPath, 'utf8').catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  const target = join(worktree, 'node_modules')
+  if (marker !== undefined) {
+    const record = JSON.parse(marker) as { base?: unknown }
+    if (record.base !== base) throw new Error(`issue-session: isolated dependencies for ${worktree} have the wrong base`)
+    const targetStat = await lstat(target).catch((error: unknown) => {
+      if (isNodeError(error) && error.code === 'ENOENT') return undefined
+      throw error
+    })
+    if (targetStat?.isDirectory() && !targetStat.isSymbolicLink()) return
+    await rm(markerPath, { force: true })
+  }
+  const targetStat = await lstat(target).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (targetStat?.isSymbolicLink()) await unlink(target)
+  else if (targetStat?.isDirectory()) await rm(target, { recursive: true })
+  else if (targetStat !== undefined) throw new Error(`issue-session: ${target} is not a dependency directory`)
+  await installWorktreeDependencies(worktree)
+  const installed = await stat(target).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (installed === undefined || !installed.isDirectory()) {
+    throw new Error(`issue-session: pnpm did not create isolated dependencies for ${worktree}`)
+  }
+  const content = `${JSON.stringify({ base })}\n`
+  if (!await publishCompleteFile(markerPath, content)) {
+    const existing = await readFile(markerPath, 'utf8')
+    if (existing !== content) throw new Error(`issue-session: isolated dependency marker ${markerPath} changed concurrently`)
+  }
+}
+
+async function installWorktreeDependencies(worktree: string): Promise<void> {
+  if (process.platform === 'win32') {
+    await run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'pnpm install --frozen-lockfile --prefer-offline'], worktree)
+    return
+  }
+  await run('pnpm', ['install', '--frozen-lockfile', '--prefer-offline'], worktree)
+}
+
+async function verifyFreshWorktree(path: string, base: string): Promise<void> {
   const [{ stdout: status }, { stdout: head }] = await Promise.all([
     run('git', ['status', '--short'], path),
     run('git', ['rev-parse', 'HEAD'], path),
   ])
-  if (status !== '') throw new Error(`issue-session: existing worktree ${path} is dirty`)
-  if (head.trim() !== base) throw new Error(`issue-session: existing worktree ${path} is not based at current origin/dev`)
+  if (status !== '') throw new Error(`issue-session: unclaimed worktree ${path} is dirty`)
+  if (head.trim() !== base) throw new Error(`issue-session: unclaimed worktree ${path} moved from its recorded base`)
+}
+
+async function verifyClaimedWorktree(path: string, base: string): Promise<void> {
+  const { stdout: head } = await run('git', ['rev-parse', 'HEAD'], path)
+  await verifyAncestor(path, base, head.trim())
+}
+
+async function verifyAncestor(cwd: string, base: string, head: string): Promise<void> {
+  try {
+    await run('git', ['merge-base', '--is-ancestor', base, head], cwd)
+  } catch {
+    throw new Error(`issue-session: recorded base ${base} is not an ancestor of ${head}`)
+  }
 }
 
 function parseWorktrees(output: string): Array<{ path: string; branch: string | undefined }> {
-  return output.trim().split(/\n\n/u).filter(Boolean).map((block) => {
-    const fields = new Map(block.split('\n').map((line) => {
-      const separator = line.indexOf(' ')
-      return separator < 0 ? [line, ''] : [line.slice(0, separator), line.slice(separator + 1)]
-    }))
-    return { path: fields.get('worktree') ?? '', branch: fields.get('branch') }
-  })
+  const records: Array<{ path: string; branch: string | undefined }> = []
+  let fields = new Map<string, string>()
+  for (const field of output.split('\0')) {
+    if (field === '') {
+      if (fields.size > 0) records.push({ path: fields.get('worktree') ?? '', branch: fields.get('branch') })
+      fields = new Map()
+      continue
+    }
+    const separator = field.indexOf(' ')
+    fields.set(separator < 0 ? field : field.slice(0, separator), separator < 0 ? '' : field.slice(separator + 1))
+  }
+  if (fields.size > 0) records.push({ path: fields.get('worktree') ?? '', branch: fields.get('branch') })
+  return records
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -596,7 +781,6 @@ async function run(command: string, args: readonly string[], cwd: string): Promi
 interface CliOptions {
   readonly command: 'inspect' | 'claim' | 'handoff'
   readonly issueUrl: string
-  readonly dependencies: string[]
   readonly title?: string
   readonly bodyFile?: string
 }
@@ -604,25 +788,22 @@ interface CliOptions {
 function parseCli(argv: readonly string[]): CliOptions {
   const [command, issueUrl, ...rest] = argv
   if (command !== 'inspect' && command !== 'claim' && command !== 'handoff') {
-    throw new Error('usage: issue-session.ts <inspect|claim|handoff> <issue-url> [--dependency URL] [--title TITLE --body-file FILE]')
+    throw new Error('usage: issue-session.ts <inspect|claim|handoff> <issue-url> [--title TITLE --body-file FILE]')
   }
   if (issueUrl === undefined) throw new Error('issue-session: issue URL is required')
-  const dependencies: string[] = []
   let title: string | undefined
   let bodyFile: string | undefined
   for (let index = 0; index < rest.length; index += 2) {
     const flag = rest[index]
     const value = rest[index + 1]
     if (value === undefined) throw new Error(`issue-session: ${flag} requires a value`)
-    if (flag === '--dependency') dependencies.push(value)
-    else if (flag === '--title') title = value
+    if (flag === '--title') title = value
     else if (flag === '--body-file') bodyFile = value
     else throw new Error(`issue-session: unknown option ${flag}`)
   }
   return {
     command,
     issueUrl,
-    dependencies,
     ...(title === undefined ? {} : { title }),
     ...(bodyFile === undefined ? {} : { bodyFile }),
   }
@@ -632,7 +813,7 @@ async function main(): Promise<void> {
   const options = parseCli(process.argv.slice(2))
   const sessionId = process.env.DSH_SESSION_ID ?? ''
   const coordinator = new IssueSessionCoordinator(new GitHubIssueSessionAdapter(process.cwd()))
-  const common = { issueUrl: options.issueUrl, sessionId, dependencies: options.dependencies }
+  const common = { issueUrl: options.issueUrl, sessionId }
   let result: AdmissionResult | ClaimResult | HandoffResult
   if (options.command === 'inspect') result = await coordinator.inspect(common)
   else if (options.command === 'claim') result = await coordinator.claim(common)

@@ -9,6 +9,12 @@
 
 <!-- Repository pointers, prior issues, and constraints the implementing session needs. -->
 
+## Dependencies
+
+<!-- Use one exact DavSimFel/aph issue or pull request URL per list item, or only `- None`. -->
+
+- None
+
 ## Non-goals
 
 ## Verification
