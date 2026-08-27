@@ -266,7 +266,7 @@ describe('aph issue session coordination', () => {
     await adapter.verifyRepository()
 
     expect(calls).toContainEqual([
-      'gh', 'repo', 'view', '--repo', 'DavSimFel/aph', '--json', 'nameWithOwner', '--jq', '.nameWithOwner',
+      'gh', 'repo', 'view', 'DavSimFel/aph', '--json', 'nameWithOwner', '--jq', '.nameWithOwner',
     ])
   })
 
@@ -425,6 +425,7 @@ describe('aph issue session coordination', () => {
     const dependencies = await lstat(join(created.path, 'node_modules'))
     expect(dependencies.isDirectory()).toBe(true)
     expect(dependencies.isSymbolicLink()).toBe(false)
+    expect((await lstat(join(repository, '.aph-worktrees', '.pnpm-store'))).isDirectory()).toBe(true)
     expect(await git(repository, 'status', '--short')).toBe('')
     const localExclude = await readFile(join(repository, '.git', 'info', 'exclude'), 'utf8')
     expect(localExclude).toContain('/.aph-worktrees/')
@@ -583,11 +584,18 @@ describe('aph issue session coordination', () => {
       .toBe(join(await realpath(first.path), 'packages', 'fixture-a'))
     expect(await realpath(join(second.path, 'node_modules', 'fixture-a')))
       .toBe(join(await realpath(second.path), 'packages', 'fixture-a'))
-    expect(await pnpm(first.path, 'store', 'path')).toBe(await pnpm(second.path, 'store', 'path'))
+    const sharedStore = join(repository, '.aph-worktrees', '.pnpm-store')
+    expect((await lstat(sharedStore)).isDirectory()).toBe(true)
+    expect(await pnpm(first.path, '--store-dir', sharedStore, 'store', 'path'))
+      .toBe(await pnpm(second.path, '--store-dir', sharedStore, 'store', 'path'))
     const secondManifestBefore = await readFile(join(second.path, 'package.json'), 'utf8')
     const secondLockBefore = await readFile(join(second.path, 'pnpm-lock.yaml'), 'utf8')
 
-    await pnpm(first.path, 'add', '--offline', '--workspace-root', 'fixture-b@workspace:*')
+    await pnpm(
+      first.path,
+      '--store-dir', sharedStore,
+      'add', '--offline', '--workspace-root', 'fixture-b@workspace:*',
+    )
     const firstManifest = JSON.parse(await readFile(join(first.path, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> }
     const secondManifest = JSON.parse(await readFile(join(second.path, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> }
     expect(firstManifest.dependencies?.['fixture-b']).toBe('workspace:*')

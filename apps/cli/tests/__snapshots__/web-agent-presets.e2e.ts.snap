@@ -72,14 +72,14 @@ Run \`claim\` after admission. The coordinator:
 
 - fetches current \`origin/dev\` for a fresh claim, durably records the session, branch, worktree, and base before local branch creation, then reconciles either half after interruption;
 - creates \`issue-<number>-implementer\` and \`<repository>/.aph-worktrees/issue-<number>\` at that recorded base inside the default \`workspace-write\` boundary, with \`/.aph-worktrees/\` only in the local Git exclude;
-- runs \`pnpm install --frozen-lockfile --prefer-offline\` in the worktree so each session owns its writable \`node_modules\` links while pnpm reuses its content-addressed store;
+- runs \`pnpm install --frozen-lockfile --prefer-offline\` in the worktree so each session owns its writable \`node_modules\` links while all issue worktrees reuse the workspace-local \`.aph-worktrees/.pnpm-store\` content-addressed store;
 - atomically creates \`origin/aph-claims/issue-<number>\` without force, with \`DSH_SESSION_ID\`, branch, worktree, and base commit in the reservation commit;
 - removes a newly created losing worktree when another session wins the remote-ref race;
 - idempotently creates the assignment comment and moves \`stage/ready\` to \`stage/in-session\` only after this session owns the reservation.
 
 The reservation remains after a comment or label failure. Rerun \`claim\`; it verifies the same session and recorded base, permits that claimed branch's dirty or committed implementation state when the base remains an ancestor, and resumes at the first incomplete step even when \`origin/dev\` advanced. An unclaimed provisional worktree must remain clean at its recorded base. Never delete, replace, force-push, or reuse another session's claim, branch, or worktree.
 
-Change into the returned worktree. All implementation reads, edits, checks, commits, and pushes run there. Never clean or modify the shared checkout.
+Change into the returned worktree. All implementation reads, edits, checks, commits, and pushes run there. Never clean or modify the shared checkout. The coordinator provisions dependencies; if a manifest or lockfile change requires a pnpm command that writes the store, pass the existing workspace-local store explicitly: POSIX uses \`pnpm --store-dir "$(dirname "$(git rev-parse --show-toplevel)")/.pnpm-store" ...\`, and PowerShell derives \`$Store = Join-Path (Split-Path (git rev-parse --show-toplevel).Trim()) '.pnpm-store'\` before \`& pnpm.cmd --store-dir $Store ...\`.
 
 ## Implement and check
 

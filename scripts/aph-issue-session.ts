@@ -295,7 +295,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     const [{ stdout: owner }, { stdout: remote }] = await Promise.all([
       this.command(
         'gh',
-        ['repo', 'view', '--repo', REPOSITORY, '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
+        ['repo', 'view', REPOSITORY, '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
         this.cwd,
       ),
       this.command('git', ['remote', 'get-url', 'origin'], this.cwd),
@@ -360,6 +360,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     const branch = `issue-${number}-implementer`
     const ownerFile = join(worktreeRoot, `issue-${number}.owner.json`)
     const dependenciesFile = join(worktreeRoot, `issue-${number}.dependencies.json`)
+    const storePath = join(worktreeRoot, '.pnpm-store')
     await ensureLocalExclude(root)
     await run('git', ['fetch', 'origin', 'dev'], root)
     const { stdout: baseOutput } = await run('git', ['rev-parse', 'origin/dev'], root)
@@ -407,7 +408,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     if (!worktreePathsEqual(existing.path, path) || existing.branch !== `refs/heads/${branch}`) {
       throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
     }
-    await ensureWorktreeDependencies(path, dependenciesFile, owner.base)
+    await ensureWorktreeDependencies(path, dependenciesFile, owner.base, storePath)
     if (claim === undefined) await verifyFreshWorktree(path, owner.base)
     else await verifyClaimedWorktree(path, owner.base)
     return { path, branch, base: owner.base, created }
@@ -709,7 +710,12 @@ async function removeProvisionalWorktree(
   await rm(dependenciesFile, { force: true })
 }
 
-async function ensureWorktreeDependencies(worktree: string, markerPath: string, base: string): Promise<void> {
+async function ensureWorktreeDependencies(
+  worktree: string,
+  markerPath: string,
+  base: string,
+  storePath: string,
+): Promise<void> {
   const marker = await readFile(markerPath, 'utf8').catch((error: unknown) => {
     if (isNodeError(error) && error.code === 'ENOENT') return undefined
     throw error
@@ -732,7 +738,7 @@ async function ensureWorktreeDependencies(worktree: string, markerPath: string, 
   if (targetStat?.isSymbolicLink()) await unlink(target)
   else if (targetStat?.isDirectory()) await rm(target, { recursive: true })
   else if (targetStat !== undefined) throw new Error(`issue-session: ${target} is not a dependency directory`)
-  await installWorktreeDependencies(worktree)
+  await installWorktreeDependencies(worktree, storePath)
   const installed = await stat(target).catch((error: unknown) => {
     if (isNodeError(error) && error.code === 'ENOENT') return undefined
     throw error
@@ -747,12 +753,13 @@ async function ensureWorktreeDependencies(worktree: string, markerPath: string, 
   }
 }
 
-async function installWorktreeDependencies(worktree: string): Promise<void> {
+async function installWorktreeDependencies(worktree: string, storePath: string): Promise<void> {
   if (process.platform === 'win32') {
-    await run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'pnpm install --frozen-lockfile --prefer-offline'], worktree)
+    const command = `pnpm install --frozen-lockfile --prefer-offline --store-dir "${storePath}"`
+    await run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', command], worktree)
     return
   }
-  await run('pnpm', ['install', '--frozen-lockfile', '--prefer-offline'], worktree)
+  await run('pnpm', ['install', '--frozen-lockfile', '--prefer-offline', '--store-dir', storePath], worktree)
 }
 
 async function verifyFreshWorktree(path: string, base: string): Promise<void> {
