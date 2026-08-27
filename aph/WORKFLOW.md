@@ -24,7 +24,9 @@ An issue is a brief sized for one aph session, and pasting its URL into a fresh 
 
 The manager writes each issue from raw operator intent and labels it `stage/spec`. Operator approval moves it to `stage/ready`. The operator assigns work by pasting the issue into an aph session; the assignment is recorded as an issue comment naming the session, and the label moves to `stage/in-session`.
 
-Stage labels live on the issue only, and the manager maintains them: `stage/spec` → `stage/ready` → `stage/in-session` → `stage/agent-review` → `stage/operator-review`. `stage/spec` and `stage/operator-review` are the only states that wait on the operator.
+[`scripts/aph-issue-session.ts`](../scripts/aph-issue-session.ts) admits, claims, and publishes implementation work. The approved issue body and owner-authored amendments are the only task instructions; public comments and state-record comments never enter the briefing. A claim creates `origin/aph-claims/issue-<number>` without force before commenting or changing the stage, binding the issue to `DSH_SESSION_ID`. The implementation worktree lives under the development checkout's locally excluded `.aph-worktrees/` directory, which stays writable under the default `workspace-write` policy. Claim and publication steps reconcile their existing remote state after restart instead of duplicating comments or PRs.
+
+Stage labels live on the issue only, and the manager owns the stage policy and any corrective transition. The implementer performs the two normal transitions attached to its work: the repository coordinator moves `stage/ready` to `stage/in-session` only after its atomic remote claim succeeds, then moves `stage/in-session` to `stage/agent-review` only after the draft PR exists and is linked. The manager performs `stage/spec` → `stage/ready`, manages the review loop, and moves an accepted draft to `stage/operator-review`. `stage/spec` and `stage/operator-review` are the only states that wait on the operator.
 
 ## Pull requests
 
