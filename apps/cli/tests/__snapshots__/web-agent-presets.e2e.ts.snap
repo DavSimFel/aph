@@ -21,14 +21,14 @@ The issue URL is the complete briefing. Act as the implementer and carry the iss
 
 ## Use the coordinator
 
-Resolve the repository-owned coordinator before claiming so the same reviewed executable remains available after changing into a worktree based on \`origin/dev\`. Shell tool calls do not share variables: initialize the paths again in each coordinator call, use the source checkout as that call's working directory, run only the command needed at that step, and pass an absolute body-file path to \`handoff\`.
+Resolve the repository-owned coordinator from the task checkout that was the current working directory when the issue URL arrived. Never use the separate DeepSeek Harness implementation checkout named in the system prompt or this skill's resource directory as the coordinator source or working directory. Shell tool calls do not share variables: rederive the task root in each coordinator call, run only the command needed at that step from that root, and pass an absolute body-file path to \`handoff\`; the reviewed executable remains there after changing into a worktree based on \`origin/dev\`.
 
 On POSIX shells:
 
 \`\`\`sh
-SOURCE_ROOT="$(git rev-parse --show-toplevel)"
-TSX="$SOURCE_ROOT/node_modules/.bin/tsx"
-ISSUE_SESSION="$SOURCE_ROOT/scripts/aph-issue-session.ts"
+TASK_ROOT="$(git rev-parse --show-toplevel)"
+TSX="$TASK_ROOT/node_modules/.bin/tsx"
+ISSUE_SESSION="$TASK_ROOT/scripts/aph-issue-session.ts"
 "$TSX" "$ISSUE_SESSION" inspect <issue-url>
 "$TSX" "$ISSUE_SESSION" claim <issue-url>
 "$TSX" "$ISSUE_SESSION" handoff <issue-url> --title <title> --body-file <absolute-file>
@@ -37,9 +37,9 @@ ISSUE_SESSION="$SOURCE_ROOT/scripts/aph-issue-session.ts"
 On PowerShell:
 
 \`\`\`powershell
-$SourceRoot = (git rev-parse --show-toplevel).Trim()
-$Tsx = Join-Path $SourceRoot 'node_modules/.bin/tsx.cmd'
-$IssueSession = Join-Path $SourceRoot 'scripts/aph-issue-session.ts'
+$TaskRoot = (git rev-parse --show-toplevel).Trim()
+$Tsx = Join-Path $TaskRoot 'node_modules/.bin/tsx.cmd'
+$IssueSession = Join-Path $TaskRoot 'scripts/aph-issue-session.ts'
 & $Tsx $IssueSession inspect <issue-url>
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $Tsx $IssueSession claim <issue-url>
