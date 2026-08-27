@@ -43,7 +43,7 @@ A fresh issue must be open and `stage/ready`. A resumed session may continue at 
 Run `claim` after admission. The coordinator:
 
 - fetches current `origin/dev` and creates `issue-<number>-implementer` at that exact commit;
-- creates the worktree under `<repository>/.aph-worktrees/issue-<number>`, inside the default `workspace-write` boundary, and adds `/.aph-worktrees/` only to the repository's local Git exclude file;
+- creates the worktree under `<repository>/.aph-worktrees/issue-<number>`, inside the default `workspace-write` boundary, adds `/.aph-worktrees/` only to the repository's local Git exclude file, and links the development checkout's installed `node_modules` so hooks run without a second install;
 - atomically creates `origin/aph-claims/issue-<number>` without force, with `DSH_SESSION_ID`, branch, worktree, and base commit in the reservation commit;
 - removes a newly created losing worktree when another session wins the remote-ref race;
 - idempotently creates the assignment comment and moves `stage/ready` to `stage/in-session` only after this session owns the reservation.

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -240,7 +240,9 @@ describe('aph issue session coordination', () => {
     await git(repository, 'config', 'user.name', 'Fixture')
     await git(repository, 'config', 'user.email', 'fixture@example.com')
     await writeFile(join(repository, 'README.md'), 'fixture\n')
-    await git(repository, 'add', 'README.md')
+    await writeFile(join(repository, '.gitignore'), 'node_modules/\n')
+    await mkdir(join(repository, 'node_modules'))
+    await git(repository, 'add', 'README.md', '.gitignore')
     await git(repository, 'commit', '-m', 'fixture')
     await git(repository, 'branch', '-M', 'dev')
     await git(repository, 'push', '-u', 'origin', 'dev')
@@ -255,8 +257,11 @@ describe('aph issue session coordination', () => {
       created: true,
     })
     expect(resumed).toEqual({ ...created, created: false })
+    expect((await lstat(join(created.path, 'node_modules'))).isSymbolicLink()).toBe(true)
     expect(await git(repository, 'status', '--short')).toBe('')
-    expect(await readFile(join(repository, '.git', 'info', 'exclude'), 'utf8')).toContain('/.aph-worktrees/')
+    const localExclude = await readFile(join(repository, '.git', 'info', 'exclude'), 'utf8')
+    expect(localExclude).toContain('/.aph-worktrees/')
+    expect(localExclude).toContain('/node_modules')
     await expect(adapter.ensureWorktree(42, SESSION_B)).rejects.toThrow(`belongs to DSH session ${SESSION_A}`)
   })
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S pnpm exec tsx
 
 import { execFile } from 'node:child_process'
-import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, lstat, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
@@ -156,7 +156,7 @@ export class IssueSessionCoordinator {
     const trusted = trustedComments(issue.comments)
     return {
       issue: approvedIssue(issue),
-      stage: stage as Stage,
+      stage,
       claim,
       trustedAmendments: trusted.amendments,
       ignoredCommentCount: trusted.ignored,
@@ -340,6 +340,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
       if (existing.path !== path || existing.branch !== `refs/heads/${branch}` || existingOwner?.sessionId !== sessionId) {
         throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
       }
+      await ensureWorktreeDependencies(root, path)
       await verifyWorktree(path, base)
       return { path, branch, base, created: false }
     }
@@ -349,6 +350,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     await mkdir(worktreeRoot, { recursive: true })
     await run('git', ['worktree', 'add', '-b', branch, path, 'origin/dev'], root)
     try {
+      await ensureWorktreeDependencies(root, path)
       await writeFile(ownerFile, `${JSON.stringify({ issue: number, sessionId, branch, path, base })}\n`, { flag: 'wx' })
       await verifyWorktree(path, base)
     } catch (error) {
@@ -512,8 +514,37 @@ async function ensureLocalExclude(root: string): Promise<void> {
     if (isNodeError(error) && error.code === 'ENOENT') return ''
     throw error
   })
-  if (existing.split(/\r?\n/u).includes('/.aph-worktrees/')) return
-  await appendFile(exclude, `${existing.endsWith('\n') || existing === '' ? '' : '\n'}/.aph-worktrees/\n`)
+  const lines = existing.split(/\r?\n/u)
+  const missing = ['/.aph-worktrees/', '/node_modules'].filter(entry => !lines.includes(entry))
+  if (missing.length === 0) return
+  const separator = existing.endsWith('\n') || existing === '' ? '' : '\n'
+  await appendFile(exclude, `${separator}${missing.join('\n')}\n`)
+}
+
+async function ensureWorktreeDependencies(root: string, worktree: string): Promise<void> {
+  const source = join(root, 'node_modules')
+  const target = join(worktree, 'node_modules')
+  const sourceStat = await stat(source).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (sourceStat === undefined || !sourceStat.isDirectory()) {
+    throw new Error(`issue-session: ${root} has no node_modules directory; run pnpm install before claiming`)
+  }
+  const targetStat = await lstat(target).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (targetStat === undefined) {
+    await symlink(source, target, process.platform === 'win32' ? 'junction' : 'dir')
+    return
+  }
+  if (targetStat.isDirectory()) return
+  if (targetStat.isSymbolicLink()) {
+    const [actual, expected] = await Promise.all([realpath(target), realpath(source)])
+    if (actual === expected) return
+  }
+  throw new Error(`issue-session: ${target} is not a usable dependency directory`)
 }
 
 async function readOwner(path: string): Promise<{ sessionId: string } | undefined> {
