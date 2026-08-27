@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import {
+  canonicalWorktreePath,
   GitHubIssueSessionAdapter,
   IssueSessionCoordinator,
   type IssueSessionAdapter,
@@ -251,6 +252,22 @@ describe('aph issue session coordination', () => {
     await expect(new IssueSessionCoordinator(adapter).claim({ issueUrl: ISSUE_URL, sessionId: SESSION_A }))
       .rejects.toThrow('invalid dependency entry')
     expect(state.mutations).toEqual([])
+  })
+
+  it('rejects an issue-form URL when GitHub identifies the dependency as a pull request', async () => {
+    const dependencyUrl = 'https://github.com/DavSimFel/aph/issues/23'
+    const adapter = new GitHubIssueSessionAdapter('/repo', () => Promise.resolve({
+      stdout: '{"state":"CLOSED","url":"https://github.com/DavSimFel/aph/pull/23"}\n',
+      stderr: '',
+    }))
+
+    await expect(adapter.readDependency(dependencyUrl))
+      .rejects.toThrow(`GitHub returned https://github.com/DavSimFel/aph/pull/23 for dependency ${dependencyUrl}`)
+  })
+
+  it('canonicalizes Git and Node Windows worktree spellings identically', () => {
+    expect(canonicalWorktreePath('C:\\Users\\Owner\\aph repo\\.aph-worktrees\\issue-42', 'win32'))
+      .toBe(canonicalWorktreePath('c:/users/owner/aph repo/.aph-worktrees/issue-42', 'win32'))
   })
 
   it.each([

@@ -3,7 +3,7 @@
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { appendFile, link, lstat, mkdir, open, readFile, rm, stat, unlink } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve, win32 as pathWin32 } from 'node:path'
 import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
 
@@ -13,6 +13,7 @@ const OWNER = 'DavSimFel'
 const STATE_COMMENT_PREFIXES = ['Assigned to DSH session `', 'Draft implementation PR: ']
 const CLAIM_MESSAGE_HEADER = 'APH_ISSUE_CLAIM_V1'
 
+type CommandRunner = typeof run
 type Stage = 'stage/ready' | 'stage/in-session' | 'stage/agent-review'
 
 interface IssueComment {
@@ -191,7 +192,7 @@ export class IssueSessionCoordinator {
       const owner = claim?.sessionId ?? 'an unreadable remote reservation'
       throw new Error(`issue-session: issue #${admitted.issue.number} is reserved by ${owner}`)
     }
-    if (claim.branch !== worktree.branch || claim.worktree !== worktree.path || claim.base !== worktree.base) {
+    if (claim.branch !== worktree.branch || !worktreePathsEqual(claim.worktree, worktree.path) || claim.base !== worktree.base) {
       throw new Error(`issue-session: issue #${admitted.issue.number} reservation does not match this worktree`)
     }
 
@@ -271,9 +272,24 @@ export class IssueSessionCoordinator {
   }
 }
 
+/**
+ * Canonicalize a worktree path for stable Node/Git comparisons on one host.
+ * @param value - absolute or repository-relative path emitted by Node or Git.
+ * @param platform - host path convention; tests supply win32 on other hosts.
+ * @returns the absolute comparison spelling used by owner and worktree records.
+ */
+export function canonicalWorktreePath(value: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') return pathWin32.resolve(value).replaceAll('\\', '/').toLowerCase()
+  return resolve(value)
+}
+
+function worktreePathsEqual(left: string, right: string): boolean {
+  return canonicalWorktreePath(left) === canonicalWorktreePath(right)
+}
+
 /** Real Git and GitHub adapter used by the command-line entry point. */
 export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
-  constructor(private readonly cwd: string) {}
+  constructor(private readonly cwd: string, private readonly dependencyCommand: CommandRunner = run) {}
 
   async verifyRepository(): Promise<void> {
     const [{ stdout: owner }, { stdout: remote }] = await Promise.all([
@@ -310,15 +326,25 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     if (pull !== null) {
       const pullNumber = pull[1]
       if (pullNumber === undefined) throw new Error(`issue-session: invalid pull request dependency URL ${url}`)
-      const { stdout } = await run('gh', ['pr', 'view', pullNumber, '--repo', REPOSITORY, '--json', 'state,mergedAt,url'], this.cwd)
+      const { stdout } = await this.dependencyCommand(
+        'gh',
+        ['pr', 'view', pullNumber, '--repo', REPOSITORY, '--json', 'state,mergedAt,url'],
+        this.cwd,
+      )
       const record = JSON.parse(stdout) as { state: string; mergedAt: string | null; url: string }
+      if (record.url !== url) throw new Error(`issue-session: GitHub returned ${record.url} for dependency ${url}`)
       return { url: record.url, kind: 'pull-request', closed: record.state === 'CLOSED', merged: record.mergedAt !== null }
     }
     const issue = url.match(/^https:\/\/github\.com\/DavSimFel\/aph\/issues\/(\d+)$/u)
     const issueNumber = issue?.[1]
     if (issueNumber === undefined) throw new Error(`issue-session: unsupported dependency URL ${url}`)
-    const { stdout } = await run('gh', ['issue', 'view', issueNumber, '--repo', REPOSITORY, '--json', 'state,url'], this.cwd)
+    const { stdout } = await this.dependencyCommand(
+      'gh',
+      ['issue', 'view', issueNumber, '--repo', REPOSITORY, '--json', 'state,url'],
+      this.cwd,
+    )
     const record = JSON.parse(stdout) as { state: string; url: string }
+    if (record.url !== url) throw new Error(`issue-session: GitHub returned ${record.url} for dependency ${url}`)
     return { url: record.url, kind: 'issue', closed: record.state === 'CLOSED', merged: false }
   }
 
@@ -326,7 +352,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     const { stdout: rootOutput } = await run('git', ['rev-parse', '--show-toplevel'], this.cwd)
     const root = rootOutput.trim()
     const worktreeRoot = join(root, '.aph-worktrees')
-    const path = join(worktreeRoot, `issue-${number}`)
+    const path = canonicalWorktreePath(join(worktreeRoot, `issue-${number}`))
     const branch = `issue-${number}-implementer`
     const ownerFile = join(worktreeRoot, `issue-${number}.owner.json`)
     const dependenciesFile = join(worktreeRoot, `issue-${number}.dependencies.json`)
@@ -342,7 +368,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
       throw new Error(`issue-session: local issue #${number} worktree belongs to DSH session ${owner.sessionId}`)
     }
     let existing = await findIssueWorktree(root, path, branch)
-    if (existing !== undefined && (existing.path !== path || existing.branch !== `refs/heads/${branch}`)) {
+    if (existing !== undefined && (!worktreePathsEqual(existing.path, path) || existing.branch !== `refs/heads/${branch}`)) {
       throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
     }
     if (owner === undefined && existing !== undefined && claim === undefined) {
@@ -374,7 +400,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
       if (existing === undefined) throw new Error(`issue-session: created worktree ${path} was not registered`)
       created = true
     }
-    if (existing.path !== path || existing.branch !== `refs/heads/${branch}`) {
+    if (!worktreePathsEqual(existing.path, path) || existing.branch !== `refs/heads/${branch}`) {
       throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
     }
     await ensureWorktreeDependencies(path, dependenciesFile, owner.base)
@@ -579,7 +605,7 @@ async function findIssueWorktree(
   branch: string,
 ): Promise<{ path: string; branch: string | undefined } | undefined> {
   const { stdout } = await run('git', ['worktree', 'list', '--porcelain', '-z'], root)
-  return parseWorktrees(stdout).find(entry => entry.path === path || entry.branch === `refs/heads/${branch}`)
+  return parseWorktrees(stdout).find(entry => worktreePathsEqual(entry.path, path) || entry.branch === `refs/heads/${branch}`)
 }
 
 async function localBranchHead(root: string, branch: string): Promise<string | undefined> {
@@ -644,7 +670,8 @@ function requireMatchingClaim(actual: ClaimRecord, expected: {
   base?: string
 }): void {
   if (actual.issue !== expected.issue || actual.sessionId !== expected.sessionId || actual.branch !== expected.branch
-    || actual.worktree !== expected.worktree || (expected.base !== undefined && actual.base !== expected.base)) {
+    || !worktreePathsEqual(actual.worktree, expected.worktree)
+    || (expected.base !== undefined && actual.base !== expected.base)) {
     throw new Error(`issue-session: issue #${expected.issue} ownership does not match this worktree`)
   }
 }
