@@ -362,7 +362,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     const dependenciesFile = join(worktreeRoot, `issue-${number}.dependencies.json`)
     const storePath = join(worktreeRoot, '.pnpm-store')
     await ensureLocalExclude(root)
-    await run('git', ['fetch', 'origin', 'dev'], root)
+    await run('git', ['fetch', 'origin', 'dev:refs/remotes/origin/dev'], root)
     const { stdout: baseOutput } = await run('git', ['rev-parse', 'origin/dev'], root)
     const currentBase = baseOutput.trim()
     if (claim !== undefined) requireMatchingClaim(claim, { issue: number, sessionId, branch, worktree: path })

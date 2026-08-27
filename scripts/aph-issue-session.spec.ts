@@ -409,6 +409,15 @@ describe('aph issue session coordination', () => {
     expect([SESSION_A, SESSION_B]).toContain(claimA?.sessionId)
   })
 
+  it('fetches origin/dev into the remote-tracking ref when a clone does not have it', async () => {
+    const { repository } = await fixtureRepository('aph-issue-missing-origin-dev-')
+    await git(repository, 'update-ref', '-d', 'refs/remotes/origin/dev')
+
+    const created = await new GitHubIssueSessionAdapter(repository).ensureWorktree(42, SESSION_A, undefined)
+
+    expect(await git(repository, 'rev-parse', 'origin/dev')).toBe(created.base)
+  })
+
   it('creates a recoverable worktree inside the workspace-write root with isolated dependencies', async () => {
     const { repository } = await fixtureRepository('aph issue worktree ')
     const adapter = new GitHubIssueSessionAdapter(repository)
