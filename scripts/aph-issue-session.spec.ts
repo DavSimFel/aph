@@ -254,6 +254,22 @@ describe('aph issue session coordination', () => {
     expect(state.mutations).toEqual([])
   })
 
+  it('verifies the explicit repository even when gh has another ambient repository', async () => {
+    const calls: string[][] = []
+    const adapter = new GitHubIssueSessionAdapter('/repo', (command, args) => {
+      calls.push([command, ...args])
+      return Promise.resolve(command === 'gh'
+        ? { stdout: 'DavSimFel/aph\n', stderr: '' }
+        : { stdout: 'https://github.com/DavSimFel/aph.git\n', stderr: '' })
+    })
+
+    await adapter.verifyRepository()
+
+    expect(calls).toContainEqual([
+      'gh', 'repo', 'view', '--repo', 'DavSimFel/aph', '--json', 'nameWithOwner', '--jq', '.nameWithOwner',
+    ])
+  })
+
   it('rejects an issue-form URL when GitHub identifies the dependency as a pull request', async () => {
     const dependencyUrl = 'https://github.com/DavSimFel/aph/issues/23'
     const adapter = new GitHubIssueSessionAdapter('/repo', () => Promise.resolve({

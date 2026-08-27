@@ -289,12 +289,16 @@ function worktreePathsEqual(left: string, right: string): boolean {
 
 /** Real Git and GitHub adapter used by the command-line entry point. */
 export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
-  constructor(private readonly cwd: string, private readonly dependencyCommand: CommandRunner = run) {}
+  constructor(private readonly cwd: string, private readonly command: CommandRunner = run) {}
 
   async verifyRepository(): Promise<void> {
     const [{ stdout: owner }, { stdout: remote }] = await Promise.all([
-      run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], this.cwd),
-      run('git', ['remote', 'get-url', 'origin'], this.cwd),
+      this.command(
+        'gh',
+        ['repo', 'view', '--repo', REPOSITORY, '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
+        this.cwd,
+      ),
+      this.command('git', ['remote', 'get-url', 'origin'], this.cwd),
     ])
     if (owner.trim() !== REPOSITORY) throw new Error(`issue-session: current gh repository is ${owner.trim()}, expected ${REPOSITORY}`)
     if (!isAphRemote(remote.trim())) throw new Error(`issue-session: origin is ${remote.trim()}, expected ${REPOSITORY}`)
@@ -326,7 +330,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     if (pull !== null) {
       const pullNumber = pull[1]
       if (pullNumber === undefined) throw new Error(`issue-session: invalid pull request dependency URL ${url}`)
-      const { stdout } = await this.dependencyCommand(
+      const { stdout } = await this.command(
         'gh',
         ['pr', 'view', pullNumber, '--repo', REPOSITORY, '--json', 'state,mergedAt,url'],
         this.cwd,
@@ -338,7 +342,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     const issue = url.match(/^https:\/\/github\.com\/DavSimFel\/aph\/issues\/(\d+)$/u)
     const issueNumber = issue?.[1]
     if (issueNumber === undefined) throw new Error(`issue-session: unsupported dependency URL ${url}`)
-    const { stdout } = await this.dependencyCommand(
+    const { stdout } = await this.command(
       'gh',
       ['issue', 'view', issueNumber, '--repo', REPOSITORY, '--json', 'state,url'],
       this.cwd,
