@@ -813,8 +813,9 @@ function isExecutableCommand(command: string): boolean {
   if (command.startsWith('./') || command.startsWith('../')) return /^\.\.?\/\S+(?:\s|$)/u.test(command)
   const tokens = command.match(/^(?:(?:[A-Z_][A-Z0-9_]*)=\S+\s+)*(?:sudo\s+)?([A-Za-z0-9_.-]+)(?:\s+(.+))?$/u)
   const executable = tokens?.[1]
+  const argument = tokens?.[2]
   if (executable === undefined) return false
-  return EXECUTABLES.has(executable) || (tokens[2]?.trim() ?? '') !== ''
+  return EXECUTABLES.has(executable) || (argument?.trim() ?? '') !== ''
 }
 
 function containsObservedEvidence(evidence: string, requirement: string): boolean {
