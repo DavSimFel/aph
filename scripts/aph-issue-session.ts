@@ -14,6 +14,7 @@ const STATE_COMMENT_PREFIXES = ['Assigned to DSH session `', 'Draft implementati
 const CLAIM_MESSAGE_HEADER = 'APH_ISSUE_CLAIM_V1'
 
 type CommandRunner = typeof run
+type DependencyInstaller = (worktree: string, dependenciesFile: string, storePath: string) => Promise<void>
 type Stage = 'stage/ready' | 'stage/in-session' | 'stage/agent-review'
 
 interface IssueComment {
@@ -266,18 +267,24 @@ export class IssueSessionCoordinator {
         pullRequest = await this.adapter.findPullRequest(claim.branch)
         if (pullRequest === undefined) throw error
       }
-    } else if (pullRequest.title !== input.title || pullRequest.body !== input.body) {
-      try {
-        await this.adapter.updatePullRequest(pullRequest.number, input.title, input.body)
-      } catch (error) {
-        const recovered = await this.adapter.findPullRequest(claim.branch)
-        if (recovered === undefined || recovered.title !== input.title || recovered.body !== input.body) throw error
-        pullRequest = recovered
+      requireDraftPullRequest(pullRequest, claim.branch)
+    } else {
+      requireDraftPullRequest(pullRequest, claim.branch)
+      if (pullRequest.title !== input.title || pullRequest.body !== input.body) {
+        try {
+          await this.adapter.updatePullRequest(pullRequest.number, input.title, input.body)
+        } catch (error) {
+          const recovered = await this.adapter.findPullRequest(claim.branch)
+          if (recovered === undefined) throw error
+          requireDraftPullRequest(recovered, claim.branch)
+          if (recovered.title !== input.title || recovered.body !== input.body) throw error
+          pullRequest = recovered
+        }
+        pullRequest = await this.adapter.findPullRequest(claim.branch)
+        if (pullRequest === undefined) throw new Error(`issue-session: updated PR for ${claim.branch} disappeared`)
+        requireDraftPullRequest(pullRequest, claim.branch)
       }
-      pullRequest = await this.adapter.findPullRequest(claim.branch)
-      if (pullRequest === undefined) throw new Error(`issue-session: updated PR for ${claim.branch} disappeared`)
     }
-    requireDraftPullRequest(pullRequest, claim.branch)
     requireHandoffBody(pullRequest.body, admitted.issue)
 
     if (!pullRequestLabelsMatch(pullRequest, labels)) {
@@ -285,7 +292,9 @@ export class IssueSessionCoordinator {
         await this.adapter.setPullRequestLabels(pullRequest.number, labels)
       } catch (error) {
         const recovered = await this.adapter.findPullRequest(claim.branch)
-        if (recovered === undefined || !pullRequestLabelsMatch(recovered, labels)) throw error
+        if (recovered === undefined) throw error
+        requireDraftPullRequest(recovered, claim.branch)
+        if (!pullRequestLabelsMatch(recovered, labels)) throw error
         pullRequest = recovered
       }
       pullRequest = await this.adapter.findPullRequest(claim.branch)
@@ -349,7 +358,11 @@ function worktreePathsEqual(left: string, right: string): boolean {
 
 /** Real Git and GitHub adapter used by the command-line entry point. */
 export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
-  constructor(private readonly cwd: string, private readonly command: CommandRunner = run) {}
+  constructor(
+    private readonly cwd: string,
+    private readonly command: CommandRunner = run,
+    private readonly installDependencies: DependencyInstaller = ensureWorktreeDependencies,
+  ) {}
 
   async verifyRepository(): Promise<void> {
     const [{ stdout: owner }, { stdout: remote }, { stdout: login }] = await Promise.all([
@@ -378,12 +391,12 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     const remoteRef = claimRemoteRef(number)
     const trackingRef = claimTrackingRef(number)
     try {
-      await run('git', ['fetch', 'origin', `${remoteRef}:${trackingRef}`], this.cwd)
+      await this.command('git', ['fetch', 'origin', `${remoteRef}:${trackingRef}`], this.cwd)
     } catch (error) {
-      if (await remoteRefExists(remoteRef, this.cwd)) throw error
+      if (await remoteRefExistsAfterFailure(error, remoteRef, this.cwd, this.command)) throw error
       return undefined
     }
-    const { stdout } = await run('git', ['show', '-s', '--format=%B', trackingRef], this.cwd)
+    const { stdout } = await this.command('git', ['show', '-s', '--format=%B', trackingRef], this.cwd)
     return parseClaimMessage(stdout, number)
   }
 
@@ -474,9 +487,9 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     if (!worktreePathsEqual(existing.path, path) || existing.branch !== `refs/heads/${branch}`) {
       throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
     }
-    await ensureWorktreeDependencies(path, dependenciesFile, storePath)
     if (claim === undefined) await verifyFreshWorktree(path, owner.base)
     else await verifyClaimedWorktree(path, owner.base)
+    await this.installDependencies(path, dependenciesFile, storePath)
     return { path, branch, base: owner.base, created }
   }
 
@@ -495,15 +508,16 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
 
   async tryCreateClaim(claim: ClaimRecord): Promise<boolean> {
     const message = `${CLAIM_MESSAGE_HEADER}\n${JSON.stringify(claim)}`
-    const { stdout: tree } = await run('git', ['rev-parse', `${claim.base}^{tree}`], this.cwd)
-    const { stdout: commit } = await run('git', [
+    const { stdout: tree } = await this.command('git', ['rev-parse', `${claim.base}^{tree}`], this.cwd)
+    const { stdout: commit } = await this.command('git', [
       'commit-tree', tree.trim(), '-p', claim.base, '-m', message,
     ], this.cwd)
+    const remoteRef = claimRemoteRef(claim.issue)
     try {
-      await run('git', ['push', 'origin', `${commit.trim()}:${claimRemoteRef(claim.issue)}`], this.cwd)
+      await this.command('git', ['push', 'origin', `${commit.trim()}:${remoteRef}`], this.cwd)
       return true
     } catch (error) {
-      if (await remoteRefExists(claimRemoteRef(claim.issue), this.cwd)) return false
+      if (await remoteRefExistsAfterFailure(error, remoteRef, this.cwd, this.command)) return false
       throw error
     }
   }
@@ -558,20 +572,29 @@ function trustedComments(
   issueNumber: number,
 ): { amendments: string[]; ignored: number } {
   const assignment = assignmentComment(sessionId)
-  const assignments = comments.filter(comment => trustedOwner(comment) && comment.body === assignment)
-  if (assignments.length > 1) {
+  let previousTime = Number.NEGATIVE_INFINITY
+  const assignmentIndexes: number[] = []
+  for (const [index, comment] of comments.entries()) {
+    const time = commentTime(comment, issueNumber)
+    if (time < previousTime) {
+      throw new Error(`issue-session: issue #${issueNumber} comments are not in canonical creation order`)
+    }
+    previousTime = time
+    if (trustedOwner(comment) && comment.body === assignment) assignmentIndexes.push(index)
+  }
+  if (assignmentIndexes.length > 1) {
     throw new Error(`issue-session: issue #${issueNumber} has multiple assignment records for this session`)
   }
-  const assignedAt = assignments[0] === undefined ? undefined : commentTime(assignments[0], issueNumber)
+  const assignmentIndex = assignmentIndexes[0]
   const amendments: string[] = []
   let ignored = 0
-  for (const comment of comments) {
+  for (const [index, comment] of comments.entries()) {
     if (!trustedOwner(comment)) {
       ignored += 1
       continue
     }
     if (STATE_COMMENT_PREFIXES.some(prefix => comment.body.startsWith(prefix))) continue
-    if (assignedAt === undefined || commentTime(comment, issueNumber) <= assignedAt) {
+    if (assignmentIndex === undefined || index <= assignmentIndex) {
       ignored += 1
       continue
     }
@@ -669,52 +692,129 @@ function pullRequestLabelsMatch(pullRequest: PullRequestRecord, labels: readonly
   return actual.length === labels.length && actual.every((label, index) => label === labels[index])
 }
 
+const OPERATOR_FIELDS = [
+  'Intent',
+  'What changed',
+  'See it working',
+  'Verification evidence',
+  'Decisions not in the issue',
+  'Risk & rollback',
+] as const
+
+const EXECUTABLES = new Set([
+  'bash', 'cargo', 'curl', 'gh', 'git', 'go', 'make', 'node', 'npm', 'npx', 'oxlint',
+  'pnpm', 'powershell', 'pwsh', 'pytest', 'python', 'python3', 'ruff', 'sh', 'test', 'tsc',
+  'tsx', 'uv', 'vitest', 'wget',
+])
+
 function requireHandoffBody(body: string, issue: ApprovedIssue): void {
+  const { fields, technical } = handoffSections(body)
+  const intent = fields.get('Intent') ?? ''
+  if (intent.includes('<!--') || !intent.includes(issue.url)) {
+    throw new Error(`issue-session: PR body Intent must visibly link issue #${issue.number}`)
+  }
+  if (meaningfulText(intent.replace(issue.url, '')).length < 10) {
+    throw new Error('issue-session: PR body Intent must state the delivered intent')
+  }
+  if (meaningfulText(fields.get('What changed') ?? '').length < 8) {
+    throw new Error('issue-session: PR body What changed must describe delivered behavior')
+  }
+  const demonstration = fields.get('See it working') ?? ''
+  if (extractDemonstrators(demonstration).length === 0) {
+    throw new Error('issue-session: PR body See it working must contain an exact executable command or absolute URL')
+  }
+  const evidence = fields.get('Verification evidence') ?? ''
+  for (const requirement of verificationRequirements(issue.body)) {
+    if (!containsObservedEvidence(evidence, requirement)) {
+      throw new Error(`issue-session: PR verification evidence is missing matching command/URL and meaningful result for: ${requirement}`)
+    }
+  }
+  const decisions = meaningfulText(fields.get('Decisions not in the issue') ?? '')
+  if (decisions.length < 3) throw new Error('issue-session: PR body must state decisions beyond the issue or none')
+  if (meaningfulText(fields.get('Risk & rollback') ?? '').length < 8) {
+    throw new Error('issue-session: PR body must state risk and rollback')
+  }
+  requireCheckEvidence(technical)
+}
+
+function handoffSections(body: string): { fields: Map<string, string>; technical: string } {
   if (!body.startsWith('## For the operator\n')) {
     throw new Error('issue-session: PR body must begin with ## For the operator')
   }
-  if (!body.includes(issue.url)) throw new Error(`issue-session: PR body must link issue #${issue.number}`)
-  const demonstration = boldField(body, 'See it working')
-  if (demonstration === undefined || !containsCommandOrUrl(demonstration)) {
-    throw new Error('issue-session: PR body See it working must contain an exact command or URL')
+  const detailsMarker = '<details>\n<summary>Implementation notes, checks, review trail</summary>'
+  const detailsIndex = body.indexOf(`\n${detailsMarker}`)
+  if (detailsIndex < 0) throw new Error('issue-session: PR body must contain the implementation checks details section')
+  const operator = body.slice(0, detailsIndex)
+  if (/<!--[\s\S]*?-->/u.test(operator)) {
+    throw new Error('issue-session: PR operator section must not hide content in HTML comments')
   }
-  const evidence = boldSection(body, 'Verification evidence')
-  if (evidence === undefined || !containsCommandOrUrl(evidence)) {
-    throw new Error('issue-session: PR body must contain command or URL verification evidence')
+  const lines = operator.split(/\r?\n/u)
+  const locations = OPERATOR_FIELDS.map((name) => {
+    const prefix = `**${name}:**`
+    const matches = lines.flatMap((line, index) => line.startsWith(prefix) ? [index] : [])
+    if (matches.length !== 1) throw new Error(`issue-session: PR operator section requires exactly one ${prefix} field`)
+    return { name, prefix, index: matches[0] as number }
+  })
+  for (let index = 1; index < locations.length; index += 1) {
+    if ((locations[index - 1]?.index ?? -1) >= (locations[index]?.index ?? -1)) {
+      throw new Error('issue-session: PR operator fields must follow the template order')
+    }
   }
-  for (const requirement of verificationRequirements(issue.body)) {
-    if (!containsObservedEvidence(evidence, requirement)) {
-      throw new Error(`issue-session: PR verification evidence is missing command/URL and observed result for: ${requirement}`)
+  const fields = new Map<string, string>()
+  for (const [index, location] of locations.entries()) {
+    const end = locations[index + 1]?.index ?? lines.length
+    const first = lines[location.index]?.slice(location.prefix.length).trim() ?? ''
+    const value = [first, ...lines.slice(location.index + 1, end)].join('\n').trim()
+    if (value === '') throw new Error(`issue-session: PR operator field ${location.prefix} must not be empty`)
+    fields.set(location.name, value)
+  }
+  const technical = body.slice(detailsIndex + 1)
+  if (!technical.endsWith('</details>\n') && !technical.endsWith('</details>')) {
+    throw new Error('issue-session: PR body checks details section must close the body')
+  }
+  return { fields, technical }
+}
+
+function requireCheckEvidence(technical: string): void {
+  const lines = technical.split(/\r?\n/u)
+  const checks = lines.findIndex(line => line.trim() === '- Checks run:')
+  if (checks < 0) throw new Error('issue-session: PR body checks details must contain - Checks run:')
+  const end = lines.slice(checks + 1).findIndex(line => /^- [^`]/u.test(line.trim()))
+  const entries = lines.slice(checks + 1, end < 0 ? undefined : checks + 1 + end)
+    .map(line => line.trim().replace(/^- /u, ''))
+    .filter(line => line !== '')
+  if (entries.length === 0) {
+    throw new Error('issue-session: PR body checks details must record an exact command or absolute URL')
+  }
+  for (const entry of entries) {
+    const separator = entry.indexOf(' → ')
+    const demonstrator = separator < 0 ? '' : entry.slice(0, separator).trim()
+    const observed = separator < 0 ? '' : entry.slice(separator + 3).trim()
+    if (extractDemonstrators(demonstrator).length !== 1 || !meaningfulObservedResult(observed)) {
+      throw new Error('issue-session: each PR check must pair one exact command or URL with a meaningful observed result')
     }
   }
 }
 
-function boldField(body: string, name: string): string | undefined {
-  const prefix = `**${name}:**`
-  const line = body.split(/\r?\n/u).find(candidate => candidate.startsWith(prefix))
-  return line?.slice(prefix.length).trim()
+function meaningfulText(value: string): string {
+  return value.replace(/\[[^\]]*\]\([^)]*\)/gu, ' ').replace(/[`*_#—–\-]/gu, ' ').replace(/\s+/gu, ' ').trim()
 }
 
-function boldSection(body: string, name: string): string | undefined {
-  const lines = body.split(/\r?\n/u)
-  const prefix = `**${name}:**`
-  const start = lines.findIndex(line => line.startsWith(prefix))
-  if (start < 0) return undefined
-  const first = lines[start]?.slice(prefix.length).trim() ?? ''
-  const rest: string[] = []
-  for (const line of lines.slice(start + 1)) {
-    if (/^\*\*[^*]+:\*\*/u.test(line) || line.trim() === '<details>') break
-    rest.push(line)
-  }
-  return [first, ...rest].join('\n').trim()
+function extractDemonstrators(value: string): string[] {
+  const urls = [...value.matchAll(/https?:\/\/[^\s)]+/gu)]
+    .map(match => match[0].replace(/[!,.?;:]+$/u, ''))
+  const commands = [...value.matchAll(/`([^`\n]+)`/gu)]
+    .map(match => match[1]?.trim() ?? '')
+    .filter(isExecutableCommand)
+  return [...urls, ...commands]
 }
 
-function containsCommandOrUrl(value: string): boolean {
-  if (/https:\/\/[^\s)]+/u.test(value)) return true
-  return [...value.matchAll(/`([^`\n]+)`/gu)].some((match) => {
-    const command = match[1]?.trim() ?? ''
-    return command.startsWith('./') || /\s/u.test(command)
-  })
+function isExecutableCommand(command: string): boolean {
+  if (command.startsWith('./') || command.startsWith('../')) return /^\.\.?\/\S+(?:\s|$)/u.test(command)
+  const tokens = command.match(/^(?:(?:[A-Z_][A-Z0-9_]*)=\S+\s+)*(?:sudo\s+)?([A-Za-z0-9_.-]+)(?:\s+(.+))?$/u)
+  const executable = tokens?.[1]
+  if (executable === undefined) return false
+  return EXECUTABLES.has(executable) || (tokens[2]?.trim() ?? '') !== ''
 }
 
 function containsObservedEvidence(evidence: string, requirement: string): boolean {
@@ -727,7 +827,27 @@ function containsObservedEvidence(evidence: string, requirement: string): boolea
   if (separator < 0) return false
   const demonstrator = line.slice(prefix.length, separator).trim()
   const observed = line.slice(separator + 3).trim()
-  return containsCommandOrUrl(demonstrator) && observed.length > 0
+  const actual = extractDemonstrators(demonstrator)
+  if (actual.length !== 1) return false
+  const named = extractDemonstrators(requirement)
+  if (named.length > 0 && !named.includes(actual[0] as string)) return false
+  return meaningfulObservedResult(observed)
+}
+
+function meaningfulObservedResult(observed: string): boolean {
+  const value = observed.trim()
+  if (value.length < 3 || /^(?:ok|passed|success(?:ful)?|works|done|confirmed|true|yes|complete[d]?)[.!]?$/iu.test(value)) {
+    return false
+  }
+  const exitStatus = /\b(?:exit(?:ed)?(?: with)?(?: code)?|status)\s+[0-9]+\b/iu.test(value)
+  const countedOutcome = /\b(?:[0-9]+|no|one|zero)\s+(?:checks?|comments?|failures?|files?|labels?|mutations?|tests?)\b/iu.test(value)
+    || /\b[0-9]+\s+(?:failed|passed|skipped)\b/iu.test(value)
+  const httpStatus = /\b(?:HTTP(?:\/[0-9.]+)?\s+)?[1-5][0-9]{2}(?:\s+[A-Z][A-Z ]+)?\b/u.test(value)
+  const artifact = /(?:`[^`]+`|https?:\/\/\S+|(?:stage|kind|area)\/[a-z0-9_.-]+|[a-f0-9]{12,}|(?:\.?\.?\/)[a-z0-9_./-]+)/iu.test(value)
+  const exists = artifact && /\bexists?\b[.!]?$/iu.test(value)
+  const stateWithValue = artifact
+    && /\b(?:contained|created|matched|printed|reached|remained|returned|showed|shows?|was|were)\b\s+(?:not\s+)?\S+/iu.test(value)
+  return exitStatus || countedOutcome || httpStatus || exists || stateWithValue
 }
 
 function verificationRequirements(body: string): string[] {
@@ -752,11 +872,13 @@ function requireDraftPullRequest(pullRequest: PullRequestRecord, branch: string)
 }
 
 function isAphRemote(remote: string): boolean {
+  const withoutSlash = remote.endsWith('/') ? remote.slice(0, -1) : remote
+  const normalized = withoutSlash.endsWith('.git') ? withoutSlash.slice(0, -4) : withoutSlash
   return [
     'https://github.com/DavSimFel/aph',
     'git@github.com:DavSimFel/aph',
     'ssh://git@github.com/DavSimFel/aph',
-  ].includes(remote.endsWith('.git') ? remote.slice(0, -4) : remote)
+  ].includes(normalized)
 }
 
 function claimRemoteRef(number: number): string {
@@ -780,9 +902,21 @@ function parseClaimMessage(message: string, number: number): ClaimRecord {
   return claim as ClaimRecord
 }
 
-async function remoteRefExists(ref: string, cwd: string): Promise<boolean> {
-  const { stdout } = await run('git', ['ls-remote', '--heads', 'origin', ref], cwd)
-  return stdout.trim() !== ''
+async function remoteRefExistsAfterFailure(
+  primaryError: unknown,
+  ref: string,
+  cwd: string,
+  command: CommandRunner,
+): Promise<boolean> {
+  try {
+    const { stdout } = await command('git', ['ls-remote', '--heads', 'origin', ref], cwd)
+    return stdout.trim() !== ''
+  } catch (probeError) {
+    throw new AggregateError(
+      [primaryError, probeError],
+      `issue-session: Git operation failed and remote-state probe for ${ref} also failed`,
+    )
+  }
 }
 
 async function ensureContainedDirectory(physicalRoot: string, path: string, subject: string): Promise<void> {
