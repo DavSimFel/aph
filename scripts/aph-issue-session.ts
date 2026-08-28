@@ -2,8 +2,8 @@
 
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { appendFile, link, lstat, mkdir, open, readFile, rm, stat, unlink } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve, win32 as pathWin32 } from 'node:path'
+import { appendFile, link, lstat, mkdir, open, readFile, realpath, rm, unlink } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve, sep, win32 as pathWin32 } from 'node:path'
 import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
 
@@ -20,6 +20,7 @@ interface IssueComment {
   readonly author: { readonly login: string }
   readonly authorAssociation: string
   readonly body: string
+  readonly createdAt: string
 }
 
 interface IssueRecord {
@@ -51,10 +52,13 @@ interface WorktreeRecord {
 interface PullRequestRecord {
   readonly number: number
   readonly url: string
+  readonly title: string
+  readonly body: string
   readonly state: string
   readonly isDraft: boolean
   readonly baseRefName: string
   readonly headRefName: string
+  readonly labels: readonly { readonly name: string }[]
 }
 
 interface DependencyRecord {
@@ -95,7 +99,9 @@ export interface IssueSessionAdapter {
   addIssueComment(number: number, body: string): Promise<void>
   setIssueStage(number: number, from: Stage, to: Stage): Promise<void>
   findPullRequest(branch: string): Promise<PullRequestRecord | undefined>
-  createPullRequest(branch: string, title: string, bodyFile: string): Promise<PullRequestRecord>
+  createPullRequest(branch: string, title: string, body: string): Promise<PullRequestRecord>
+  updatePullRequest(number: number, title: string, body: string): Promise<void>
+  setPullRequestLabels(number: number, labels: readonly string[]): Promise<void>
 }
 
 /** Admission input shared by inspection and mutation commands. */
@@ -112,7 +118,8 @@ export interface ClaimResult extends AdmissionResult {
 /** Publication input for an idempotent draft-PR handoff. */
 export interface HandoffInput extends AdmissionInput {
   readonly title: string
-  readonly bodyFile: string
+  readonly body: string
+  readonly labels: readonly string[]
 }
 
 /** Publication result after the issue reaches agent review. */
@@ -156,7 +163,7 @@ export class IssueSessionCoordinator {
     }
     const dependencies = issueDependencies(issue.body, issue.number)
     await this.verifyDependencies(dependencies)
-    const trusted = trustedComments(issue.comments)
+    const trusted = trustedComments(issue.comments, input.sessionId, issue.number)
     return {
       issue: approvedIssue(issue),
       stage,
@@ -184,15 +191,35 @@ export class IssueSessionCoordinator {
     }
     let claim = admitted.claim
     if (claim === undefined) {
-      const created = await this.adapter.tryCreateClaim(proposed)
-      claim = created ? proposed : await this.adapter.readClaim(admitted.issue.number)
+      const created = await this.adapter.tryCreateClaim(proposed).catch(
+        async (error: unknown) => removeRaceLoser(this.adapter, worktree, error),
+      )
+      if (created) {
+        claim = proposed
+      } else {
+        let winner: ClaimRecord | undefined
+        try {
+          winner = await this.adapter.readClaim(admitted.issue.number)
+        } catch (error) {
+          await removeRaceLoser(this.adapter, worktree, error)
+        }
+        if (winner !== undefined && claimsMatch(winner, proposed)) {
+          claim = winner
+        } else {
+          const owner = winner?.sessionId ?? 'an unreadable remote reservation'
+          await removeRaceLoser(
+            this.adapter,
+            worktree,
+            new Error(`issue-session: issue #${admitted.issue.number} is reserved by ${owner}`),
+          )
+        }
+      }
     }
-    if (claim?.sessionId !== input.sessionId) {
-      await this.adapter.removeWorktree(worktree)
-      const owner = claim?.sessionId ?? 'an unreadable remote reservation'
-      throw new Error(`issue-session: issue #${admitted.issue.number} is reserved by ${owner}`)
+    if (claim === undefined) throw new Error(`issue-session: issue #${admitted.issue.number} claim reconciliation produced no owner`)
+    if (claim.sessionId !== input.sessionId) {
+      throw new Error(`issue-session: issue #${admitted.issue.number} is reserved by ${claim.sessionId}`)
     }
-    if (claim.branch !== worktree.branch || !worktreePathsEqual(claim.worktree, worktree.path) || claim.base !== worktree.base) {
+    if (!claimsMatch(claim, proposed)) {
       throw new Error(`issue-session: issue #${admitted.issue.number} reservation does not match this worktree`)
     }
 
@@ -220,11 +247,13 @@ export class IssueSessionCoordinator {
 
   /**
    * Find or create the draft PR, then reconcile its issue link and agent-review stage.
-   * @param input - claimed issue plus PR title and template body file.
+   * @param input - claimed issue plus PR title, exact template body, and classification labels.
    * @returns the single draft PR and completed handoff state.
    */
   async handoff(input: HandoffInput): Promise<HandoffResult> {
     const admitted = await this.inspect(input)
+    const labels = requireClassificationLabels(input.labels)
+    requireHandoffBody(input.body, admitted.issue)
     const claim = admitted.claim
     if (claim === undefined || claim.sessionId !== input.sessionId) {
       throw new Error(`issue-session: issue #${admitted.issue.number} has no reservation for this session`)
@@ -232,13 +261,44 @@ export class IssueSessionCoordinator {
     let pullRequest = await this.adapter.findPullRequest(claim.branch)
     if (pullRequest === undefined) {
       try {
-        pullRequest = await this.adapter.createPullRequest(claim.branch, input.title, input.bodyFile)
+        pullRequest = await this.adapter.createPullRequest(claim.branch, input.title, input.body)
       } catch (error) {
         pullRequest = await this.adapter.findPullRequest(claim.branch)
         if (pullRequest === undefined) throw error
       }
+    } else if (pullRequest.title !== input.title || pullRequest.body !== input.body) {
+      try {
+        await this.adapter.updatePullRequest(pullRequest.number, input.title, input.body)
+      } catch (error) {
+        const recovered = await this.adapter.findPullRequest(claim.branch)
+        if (recovered === undefined || recovered.title !== input.title || recovered.body !== input.body) throw error
+        pullRequest = recovered
+      }
+      pullRequest = await this.adapter.findPullRequest(claim.branch)
+      if (pullRequest === undefined) throw new Error(`issue-session: updated PR for ${claim.branch} disappeared`)
     }
     requireDraftPullRequest(pullRequest, claim.branch)
+    requireHandoffBody(pullRequest.body, admitted.issue)
+
+    if (!pullRequestLabelsMatch(pullRequest, labels)) {
+      try {
+        await this.adapter.setPullRequestLabels(pullRequest.number, labels)
+      } catch (error) {
+        const recovered = await this.adapter.findPullRequest(claim.branch)
+        if (recovered === undefined || !pullRequestLabelsMatch(recovered, labels)) throw error
+        pullRequest = recovered
+      }
+      pullRequest = await this.adapter.findPullRequest(claim.branch)
+      if (pullRequest === undefined) throw new Error(`issue-session: labeled PR for ${claim.branch} disappeared`)
+    }
+    requireDraftPullRequest(pullRequest, claim.branch)
+    if (pullRequest.title !== input.title || pullRequest.body !== input.body) {
+      throw new Error(`issue-session: PR ${pullRequest.url} did not reach the requested title and body`)
+    }
+    requireHandoffBody(pullRequest.body, admitted.issue)
+    if (!pullRequestLabelsMatch(pullRequest, labels)) {
+      throw new Error(`issue-session: PR ${pullRequest.url} did not reach the required classification labels`)
+    }
 
     let issue = await this.adapter.readIssue(admitted.issue.number)
     const link = `Draft implementation PR: ${pullRequest.url}`
@@ -292,16 +352,18 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
   constructor(private readonly cwd: string, private readonly command: CommandRunner = run) {}
 
   async verifyRepository(): Promise<void> {
-    const [{ stdout: owner }, { stdout: remote }] = await Promise.all([
+    const [{ stdout: owner }, { stdout: remote }, { stdout: login }] = await Promise.all([
       this.command(
         'gh',
         ['repo', 'view', REPOSITORY, '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
         this.cwd,
       ),
       this.command('git', ['remote', 'get-url', 'origin'], this.cwd),
+      this.command('gh', ['api', 'user', '--jq', '.login'], this.cwd),
     ])
     if (owner.trim() !== REPOSITORY) throw new Error(`issue-session: current gh repository is ${owner.trim()}, expected ${REPOSITORY}`)
     if (!isAphRemote(remote.trim())) throw new Error(`issue-session: origin is ${remote.trim()}, expected ${REPOSITORY}`)
+    if (login.trim() !== OWNER) throw new Error(`issue-session: authenticated GitHub login is ${login.trim()}, expected ${OWNER}`)
   }
 
   async readIssue(number: number): Promise<IssueRecord> {
@@ -355,19 +417,22 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
   async ensureWorktree(number: number, sessionId: string, claim: ClaimRecord | undefined): Promise<WorktreeRecord> {
     const { stdout: rootOutput } = await run('git', ['rev-parse', '--show-toplevel'], this.cwd)
     const root = rootOutput.trim()
+    const physicalRoot = await realpath(root)
     const worktreeRoot = join(root, '.aph-worktrees')
     const path = canonicalWorktreePath(join(worktreeRoot, `issue-${number}`))
     const branch = `issue-${number}-implementer`
     const ownerFile = join(worktreeRoot, `issue-${number}.owner.json`)
     const dependenciesFile = join(worktreeRoot, `issue-${number}.dependencies.json`)
     const storePath = join(worktreeRoot, '.pnpm-store')
+    await ensureContainedDirectory(physicalRoot, worktreeRoot, 'worktree root')
+    await ensureContainedDirectory(physicalRoot, storePath, 'pnpm store')
+    await ensureContainedDirectoryIfPresent(physicalRoot, path, `issue #${number} worktree`)
     await ensureLocalExclude(root)
     await run('git', ['fetch', 'origin', 'dev:refs/remotes/origin/dev'], root)
     const { stdout: baseOutput } = await run('git', ['rev-parse', 'origin/dev'], root)
     const currentBase = baseOutput.trim()
     if (claim !== undefined) requireMatchingClaim(claim, { issue: number, sessionId, branch, worktree: path })
 
-    await mkdir(worktreeRoot, { recursive: true })
     let owner = await readOwner(ownerFile, number)
     if (owner !== undefined && owner.sessionId !== sessionId) {
       throw new Error(`issue-session: local issue #${number} worktree belongs to DSH session ${owner.sessionId}`)
@@ -403,12 +468,13 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
       await addOwnedWorktree(root, owner, claim !== undefined)
       existing = await findIssueWorktree(root, path, branch)
       if (existing === undefined) throw new Error(`issue-session: created worktree ${path} was not registered`)
+      await ensureContainedDirectoryIfPresent(physicalRoot, path, `issue #${number} worktree`)
       created = true
     }
     if (!worktreePathsEqual(existing.path, path) || existing.branch !== `refs/heads/${branch}`) {
       throw new Error(`issue-session: local branch or worktree for issue #${number} is owned by another session`)
     }
-    await ensureWorktreeDependencies(path, dependenciesFile, owner.base, storePath)
+    await ensureWorktreeDependencies(path, dependenciesFile, storePath)
     if (claim === undefined) await verifyFreshWorktree(path, owner.base)
     else await verifyClaimedWorktree(path, owner.base)
     return { path, branch, base: owner.base, created }
@@ -416,15 +482,15 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
 
   async removeWorktree(worktree: WorktreeRecord): Promise<void> {
     const root = dirname(dirname(worktree.path))
-    await run('git', ['worktree', 'remove', '--force', worktree.path], root)
-    await run('git', ['branch', '-D', worktree.branch], root)
+    const errors: unknown[] = []
+    await captureCleanup(errors, () => run('git', ['worktree', 'remove', '--force', worktree.path], root))
+    await captureCleanup(errors, () => run('git', ['branch', '-D', worktree.branch], root))
     const match = worktree.path.match(/issue-(\d+)$/u)
     if (match !== null) {
-      await Promise.all([
-        rm(join(dirname(worktree.path), `issue-${match[1]}.owner.json`), { force: true }),
-        rm(join(dirname(worktree.path), `issue-${match[1]}.dependencies.json`), { force: true }),
-      ])
+      await captureCleanup(errors, () => rm(join(dirname(worktree.path), `issue-${match[1]}.owner.json`), { force: true }))
+      await captureCleanup(errors, () => rm(join(dirname(worktree.path), `issue-${match[1]}.dependencies.json`), { force: true }))
     }
+    if (errors.length > 0) throw new AggregateError(errors, `issue-session: failed to remove losing worktree ${worktree.path}`)
   }
 
   async tryCreateClaim(claim: ClaimRecord): Promise<boolean> {
@@ -453,7 +519,7 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
   async findPullRequest(branch: string): Promise<PullRequestRecord | undefined> {
     const { stdout } = await run('gh', [
       'pr', 'list', '--repo', REPOSITORY, '--head', branch, '--state', 'all', '--limit', '10',
-      '--json', 'number,url,state,isDraft,baseRefName,headRefName',
+      '--json', 'number,url,title,body,state,isDraft,baseRefName,headRefName,labels',
     ], this.cwd)
     const records = JSON.parse(stdout) as PullRequestRecord[]
     const open = records.filter(record => record.state === 'OPEN')
@@ -461,18 +527,42 @@ export class GitHubIssueSessionAdapter implements IssueSessionAdapter {
     return open[0]
   }
 
-  async createPullRequest(branch: string, title: string, bodyFile: string): Promise<PullRequestRecord> {
+  async createPullRequest(branch: string, title: string, body: string): Promise<PullRequestRecord> {
     await run('gh', [
       'pr', 'create', '--repo', REPOSITORY, '--draft', '--base', 'dev', '--head', branch,
-      '--title', title, '--body-file', bodyFile,
+      '--title', title, '--body', body,
     ], this.cwd)
     const created = await this.findPullRequest(branch)
     if (created === undefined) throw new Error(`issue-session: created PR for ${branch} was not discoverable`)
     return created
   }
+
+  async updatePullRequest(number: number, title: string, body: string): Promise<void> {
+    await run('gh', [
+      'api', '--method', 'PATCH', `repos/${REPOSITORY}/pulls/${number}`,
+      '-f', `title=${title}`, '-f', `body=${body}`,
+    ], this.cwd)
+  }
+
+  async setPullRequestLabels(number: number, labels: readonly string[]): Promise<void> {
+    await run('gh', [
+      'api', '--method', 'PUT', `repos/${REPOSITORY}/issues/${number}/labels`,
+      ...labels.flatMap(label => ['-f', `labels[]=${label}`]),
+    ], this.cwd)
+  }
 }
 
-function trustedComments(comments: readonly IssueComment[]): { amendments: string[]; ignored: number } {
+function trustedComments(
+  comments: readonly IssueComment[],
+  sessionId: string,
+  issueNumber: number,
+): { amendments: string[]; ignored: number } {
+  const assignment = assignmentComment(sessionId)
+  const assignments = comments.filter(comment => trustedOwner(comment) && comment.body === assignment)
+  if (assignments.length > 1) {
+    throw new Error(`issue-session: issue #${issueNumber} has multiple assignment records for this session`)
+  }
+  const assignedAt = assignments[0] === undefined ? undefined : commentTime(assignments[0], issueNumber)
   const amendments: string[] = []
   let ignored = 0
   for (const comment of comments) {
@@ -481,6 +571,10 @@ function trustedComments(comments: readonly IssueComment[]): { amendments: strin
       continue
     }
     if (STATE_COMMENT_PREFIXES.some(prefix => comment.body.startsWith(prefix))) continue
+    if (assignedAt === undefined || commentTime(comment, issueNumber) <= assignedAt) {
+      ignored += 1
+      continue
+    }
     amendments.push(comment.body)
   }
   return { amendments, ignored }
@@ -488,6 +582,12 @@ function trustedComments(comments: readonly IssueComment[]): { amendments: strin
 
 function trustedOwner(comment: IssueComment): boolean {
   return comment.author.login === OWNER && comment.authorAssociation === 'OWNER'
+}
+
+function commentTime(comment: IssueComment, issueNumber: number): number {
+  const time = Date.parse(comment.createdAt)
+  if (!Number.isFinite(time)) throw new Error(`issue-session: issue #${issueNumber} has a comment with invalid creation time`)
+  return time
 }
 
 function issueDependencies(body: string, issueNumber: number): string[] {
@@ -552,6 +652,99 @@ function assignmentComment(sessionId: string): string {
   return `Assigned to DSH session \`${sessionId}\` for implementation.`
 }
 
+function requireClassificationLabels(labels: readonly string[]): string[] {
+  if (new Set(labels).size !== labels.length) throw new Error('issue-session: handoff labels must not contain duplicates')
+  if (labels.some(label => !label.startsWith('kind/') && !label.startsWith('area/'))) {
+    throw new Error('issue-session: handoff labels may contain only kind/* and area/* labels')
+  }
+  const kinds = labels.filter(label => label.startsWith('kind/'))
+  const areas = labels.filter(label => label.startsWith('area/'))
+  if (kinds.length !== 1) throw new Error('issue-session: handoff requires exactly one kind/* label')
+  if (areas.length === 0) throw new Error('issue-session: handoff requires at least one area/* label')
+  return [...labels].sort()
+}
+
+function pullRequestLabelsMatch(pullRequest: PullRequestRecord, labels: readonly string[]): boolean {
+  const actual = pullRequest.labels.map(label => label.name).sort()
+  return actual.length === labels.length && actual.every((label, index) => label === labels[index])
+}
+
+function requireHandoffBody(body: string, issue: ApprovedIssue): void {
+  if (!body.startsWith('## For the operator\n')) {
+    throw new Error('issue-session: PR body must begin with ## For the operator')
+  }
+  if (!body.includes(issue.url)) throw new Error(`issue-session: PR body must link issue #${issue.number}`)
+  const demonstration = boldField(body, 'See it working')
+  if (demonstration === undefined || !containsCommandOrUrl(demonstration)) {
+    throw new Error('issue-session: PR body See it working must contain an exact command or URL')
+  }
+  const evidence = boldSection(body, 'Verification evidence')
+  if (evidence === undefined || !containsCommandOrUrl(evidence)) {
+    throw new Error('issue-session: PR body must contain command or URL verification evidence')
+  }
+  for (const requirement of verificationRequirements(issue.body)) {
+    if (!containsObservedEvidence(evidence, requirement)) {
+      throw new Error(`issue-session: PR verification evidence is missing command/URL and observed result for: ${requirement}`)
+    }
+  }
+}
+
+function boldField(body: string, name: string): string | undefined {
+  const prefix = `**${name}:**`
+  const line = body.split(/\r?\n/u).find(candidate => candidate.startsWith(prefix))
+  return line?.slice(prefix.length).trim()
+}
+
+function boldSection(body: string, name: string): string | undefined {
+  const lines = body.split(/\r?\n/u)
+  const prefix = `**${name}:**`
+  const start = lines.findIndex(line => line.startsWith(prefix))
+  if (start < 0) return undefined
+  const first = lines[start]?.slice(prefix.length).trim() ?? ''
+  const rest: string[] = []
+  for (const line of lines.slice(start + 1)) {
+    if (/^\*\*[^*]+:\*\*/u.test(line) || line.trim() === '<details>') break
+    rest.push(line)
+  }
+  return [first, ...rest].join('\n').trim()
+}
+
+function containsCommandOrUrl(value: string): boolean {
+  if (/https:\/\/[^\s)]+/u.test(value)) return true
+  return [...value.matchAll(/`([^`\n]+)`/gu)].some((match) => {
+    const command = match[1]?.trim() ?? ''
+    return command.startsWith('./') || /\s/u.test(command)
+  })
+}
+
+function containsObservedEvidence(evidence: string, requirement: string): boolean {
+  const prefix = `${requirement} — `
+  const line = evidence.split(/\r?\n/u)
+    .map(candidate => candidate.startsWith('- ') ? candidate.slice(2) : candidate)
+    .find(candidate => candidate.startsWith(prefix))
+  if (line === undefined) return false
+  const separator = line.indexOf(' → ', prefix.length)
+  if (separator < 0) return false
+  const demonstrator = line.slice(prefix.length, separator).trim()
+  const observed = line.slice(separator + 3).trim()
+  return containsCommandOrUrl(demonstrator) && observed.length > 0
+}
+
+function verificationRequirements(body: string): string[] {
+  const lines = body.split(/\r?\n/u)
+  const start = lines.findIndex(line => line.trim() === '## Verification')
+  if (start < 0) throw new Error('issue-session: issue body is missing the required ## Verification section')
+  const section: string[] = []
+  for (const line of lines.slice(start + 1)) {
+    if (/^##\s+/u.test(line.trim())) break
+    const trimmed = line.trim()
+    if (trimmed === '' || /^<!--.*-->$/u.test(trimmed)) continue
+    section.push(trimmed.startsWith('- ') ? trimmed.slice(2) : trimmed)
+  }
+  if (section.length === 0) throw new Error('issue-session: issue ## Verification section is empty')
+  return section
+}
+
 function requireDraftPullRequest(pullRequest: PullRequestRecord, branch: string): void {
   if (pullRequest.state !== 'OPEN' || !pullRequest.isDraft || pullRequest.baseRefName !== 'dev' || pullRequest.headRefName !== branch) {
     throw new Error(`issue-session: PR ${pullRequest.url} must be an open draft from ${branch} to dev`)
@@ -559,9 +752,11 @@ function requireDraftPullRequest(pullRequest: PullRequestRecord, branch: string)
 }
 
 function isAphRemote(remote: string): boolean {
-  return remote === 'https://github.com/DavSimFel/aph.git'
-    || remote === 'git@github.com:DavSimFel/aph.git'
-    || remote === 'ssh://git@github.com/DavSimFel/aph.git'
+  return [
+    'https://github.com/DavSimFel/aph',
+    'git@github.com:DavSimFel/aph',
+    'ssh://git@github.com/DavSimFel/aph',
+  ].includes(remote.endsWith('.git') ? remote.slice(0, -4) : remote)
 }
 
 function claimRemoteRef(number: number): string {
@@ -588,6 +783,27 @@ function parseClaimMessage(message: string, number: number): ClaimRecord {
 async function remoteRefExists(ref: string, cwd: string): Promise<boolean> {
   const { stdout } = await run('git', ['ls-remote', '--heads', 'origin', ref], cwd)
   return stdout.trim() !== ''
+}
+
+async function ensureContainedDirectory(physicalRoot: string, path: string, subject: string): Promise<void> {
+  await mkdir(path, { recursive: true })
+  await ensureContainedDirectoryIfPresent(physicalRoot, path, subject)
+}
+
+async function ensureContainedDirectoryIfPresent(physicalRoot: string, path: string, subject: string): Promise<void> {
+  const info = await lstat(path).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (info === undefined) return
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error(`issue-session: ${subject} ${path} must be a real directory, not a link or other file`)
+  }
+  const physicalPath = await realpath(path)
+  const location = relative(physicalRoot, physicalPath)
+  if (location === '' || location === '..' || location.startsWith(`..${sep}`) || isAbsolute(location)) {
+    throw new Error(`issue-session: ${subject} ${path} resolves outside the task checkout`)
+  }
 }
 
 async function ensureLocalExclude(root: string): Promise<void> {
@@ -653,11 +869,20 @@ async function publishOwner(path: string, owner: ClaimRecord): Promise<void> {
   requireMatchingClaim(existing, owner)
 }
 
-async function readOwner(path: string, number: number): Promise<ClaimRecord | undefined> {
-  const content = await readFile(path, 'utf8').catch((error: unknown) => {
+async function readOwnedFile(path: string, subject: string): Promise<string | undefined> {
+  const info = await lstat(path).catch((error: unknown) => {
     if (isNodeError(error) && error.code === 'ENOENT') return undefined
     throw error
   })
+  if (info === undefined) return undefined
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`issue-session: ${subject} ${path} must be a real regular file`)
+  }
+  return readFile(path, 'utf8')
+}
+
+async function readOwner(path: string, number: number): Promise<ClaimRecord | undefined> {
+  const content = await readOwnedFile(path, 'local owner record')
   if (content === undefined) return undefined
   const owner = JSON.parse(content) as Partial<ClaimRecord>
   if (owner.issue !== number || typeof owner.sessionId !== 'string' || typeof owner.branch !== 'string'
@@ -665,6 +890,33 @@ async function readOwner(path: string, number: number): Promise<ClaimRecord | un
     throw new Error(`issue-session: invalid local owner record ${path}`)
   }
   return owner as ClaimRecord
+}
+
+function claimsMatch(left: ClaimRecord, right: ClaimRecord): boolean {
+  return left.issue === right.issue && left.sessionId === right.sessionId && left.branch === right.branch
+    && worktreePathsEqual(left.worktree, right.worktree) && left.base === right.base
+}
+
+async function removeRaceLoser(
+  adapter: IssueSessionAdapter,
+  worktree: WorktreeRecord,
+  primary: unknown,
+): Promise<never> {
+  try {
+    await adapter.removeWorktree(worktree)
+  } catch (cleanupError) {
+    const message = primary instanceof Error ? primary.message : String(primary)
+    throw new AggregateError([primary, cleanupError], message)
+  }
+  throw primary
+}
+
+async function captureCleanup(errors: unknown[], action: () => Promise<unknown>): Promise<void> {
+  try {
+    await action()
+  } catch (error) {
+    errors.push(error)
+  }
 }
 
 function requireMatchingClaim(actual: ClaimRecord, expected: {
@@ -713,43 +965,27 @@ async function removeProvisionalWorktree(
 async function ensureWorktreeDependencies(
   worktree: string,
   markerPath: string,
-  base: string,
   storePath: string,
 ): Promise<void> {
-  const marker = await readFile(markerPath, 'utf8').catch((error: unknown) => {
-    if (isNodeError(error) && error.code === 'ENOENT') return undefined
-    throw error
-  })
-  const target = join(worktree, 'node_modules')
-  if (marker !== undefined) {
-    const record = JSON.parse(marker) as { base?: unknown }
-    if (record.base !== base) throw new Error(`issue-session: isolated dependencies for ${worktree} have the wrong base`)
-    const targetStat = await lstat(target).catch((error: unknown) => {
-      if (isNodeError(error) && error.code === 'ENOENT') return undefined
-      throw error
-    })
-    if (targetStat?.isDirectory() && !targetStat.isSymbolicLink()) return
+  if (await readOwnedFile(markerPath, 'legacy dependency marker') !== undefined) {
     await rm(markerPath, { force: true })
   }
+  const target = join(worktree, 'node_modules')
   const targetStat = await lstat(target).catch((error: unknown) => {
     if (isNodeError(error) && error.code === 'ENOENT') return undefined
     throw error
   })
   if (targetStat?.isSymbolicLink()) await unlink(target)
-  else if (targetStat?.isDirectory()) await rm(target, { recursive: true })
-  else if (targetStat !== undefined) throw new Error(`issue-session: ${target} is not a dependency directory`)
+  else if (targetStat !== undefined && !targetStat.isDirectory()) {
+    throw new Error(`issue-session: ${target} is not a dependency directory`)
+  }
   await installWorktreeDependencies(worktree, storePath)
-  const installed = await stat(target).catch((error: unknown) => {
+  const installed = await lstat(target).catch((error: unknown) => {
     if (isNodeError(error) && error.code === 'ENOENT') return undefined
     throw error
   })
-  if (installed === undefined || !installed.isDirectory()) {
-    throw new Error(`issue-session: pnpm did not create isolated dependencies for ${worktree}`)
-  }
-  const content = `${JSON.stringify({ base })}\n`
-  if (!await publishCompleteFile(markerPath, content)) {
-    const existing = await readFile(markerPath, 'utf8')
-    if (existing !== content) throw new Error(`issue-session: isolated dependency marker ${markerPath} changed concurrently`)
+  if (installed === undefined || installed.isSymbolicLink() || !installed.isDirectory()) {
+    throw new Error(`issue-session: pnpm did not create real isolated dependencies for ${worktree}`)
   }
 }
 
@@ -821,22 +1057,25 @@ interface CliOptions {
   readonly issueUrl: string
   readonly title?: string
   readonly bodyFile?: string
+  readonly labels: readonly string[]
 }
 
 function parseCli(argv: readonly string[]): CliOptions {
   const [command, issueUrl, ...rest] = argv
   if (command !== 'inspect' && command !== 'claim' && command !== 'handoff') {
-    throw new Error('usage: issue-session.ts <inspect|claim|handoff> <issue-url> [--title TITLE --body-file FILE]')
+    throw new Error('usage: issue-session.ts <inspect|claim|handoff> <issue-url> [--title TITLE --body-file FILE --label LABEL ...]')
   }
   if (issueUrl === undefined) throw new Error('issue-session: issue URL is required')
   let title: string | undefined
   let bodyFile: string | undefined
+  const labels: string[] = []
   for (let index = 0; index < rest.length; index += 2) {
     const flag = rest[index]
     const value = rest[index + 1]
     if (value === undefined) throw new Error(`issue-session: ${flag} requires a value`)
     if (flag === '--title') title = value
     else if (flag === '--body-file') bodyFile = value
+    else if (flag === '--label') labels.push(value)
     else throw new Error(`issue-session: unknown option ${flag}`)
   }
   return {
@@ -844,6 +1083,7 @@ function parseCli(argv: readonly string[]): CliOptions {
     issueUrl,
     ...(title === undefined ? {} : { title }),
     ...(bodyFile === undefined ? {} : { bodyFile }),
+    labels,
   }
 }
 
@@ -859,7 +1099,8 @@ async function main(): Promise<void> {
     if (options.title === undefined || options.bodyFile === undefined) {
       throw new Error('issue-session: handoff requires --title and --body-file')
     }
-    result = await coordinator.handoff({ ...common, title: options.title, bodyFile: options.bodyFile })
+    const body = await readFile(options.bodyFile, 'utf8')
+    result = await coordinator.handoff({ ...common, title: options.title, body, labels: options.labels })
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
 }

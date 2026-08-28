@@ -6,7 +6,9 @@
 
 **What changed:** Behavior, not files.
 
-**See it working:** The exact command, URL, screenshot, or transcript; no setup left to the reader.
+**See it working:** One exact executable command or absolute URL; no setup left to the reader.
+
+**Verification evidence:** Repeat every issue **Verification** item as `- <exact item> — <command or absolute URL> → <observed result>`.
 
 **Decisions not in the issue:** Every judgment call beyond the spec, or "none".
 

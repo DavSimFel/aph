@@ -19,4 +19,4 @@
 
 ## Verification
 
-<!-- The command, URL, or transcript that demonstrates the result works. -->
+<!-- Use list items. Each item states one required outcome plus the command or URL and observable result that prove it. -->
